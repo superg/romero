@@ -9,7 +9,7 @@
             "request": "launch",
             "name": "Launch (Debug)",
             "program": "${workspaceFolder}/target/debug/romero.exe",
-            "args": [],
+            "args": ["e:/romero/dat", "e:/romero/work", "e:/romero/archive"],
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "${defaultBuildTask}"
         }

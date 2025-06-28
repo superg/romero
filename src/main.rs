@@ -12,15 +12,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let dat_path = std::path::Path::new(&args[1]);
     let work_path = std::path::Path::new(&args[2]);
-    let archive_dir = std::path::Path::new(&args[3]);
+    let archive_path = std::path::Path::new(&args[3]);
 
     println!("dat directory: {}", dat_path.display());
     println!("work directory: {}", work_path.display());
-    println!("archive directory: {}", archive_dir.display());
+    println!("archive directory: {}", archive_path.display());
     
     validate_directory(dat_path)?;
     validate_directory(work_path)?;
-    validate_directory(dat_path)?;
+    validate_directory(archive_path)?;
 
     println!("Hello, world!");
 

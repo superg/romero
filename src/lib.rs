@@ -17,8 +17,13 @@ impl Config {
     pub fn build(args: &[String]) -> Result<Config, &'static str> {
         // FIXME: properly handle command line arguments
         if args.len() != 4 {
-            eprintln!("Usage: {} <dat_dir> <work_dir> <archive_dir>", Path::new(&args[0])
-                .file_name().and_then(|name| name.to_str()).unwrap_or(&args[0]));
+            eprintln!(
+                "Usage: {} <dat_dir> <work_dir> <archive_dir>",
+                Path::new(&args[0])
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&args[0])
+            );
             return Err("invalid number of arguments".into());
         }
 
@@ -26,7 +31,11 @@ impl Config {
         let work_path = args[2].clone();
         let archive_path = args[3].clone();
 
-        Ok(Config { dat_path, work_path, archive_path })
+        Ok(Config {
+            dat_path,
+            work_path,
+            archive_path,
+        })
     }
 }
 
@@ -48,7 +57,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     println!("dat directory: {}", dat_path.display());
     println!("work directory: {}", work_path.display());
     println!("archive directory: {}", archive_path.display());
-    
+
     validate_directory(dat_path)?;
     validate_directory(work_path)?;
     validate_directory(archive_path)?;

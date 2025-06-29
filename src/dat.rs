@@ -1,7 +1,7 @@
 use std::error::Error;
-use std::path::Path;
 use std::fs::{self, File};
 use std::io::BufReader;
+use std::path::Path;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -15,21 +15,27 @@ pub struct Game {
     pub roms: Vec<Rom>
 }
 
-pub struct DAT {
+pub struct Dat {
     pub name: String,
     pub games: Vec<Game>
 }
 
-pub fn load_dats(path: &Path) -> Result<Vec<DAT>, Box<dyn Error>> {
+pub fn load_dats(path: &Path) -> Result<Vec<Dat>, Box<dyn Error>> {
     let mut dats = Vec::new();
     
-    // Read all .dat files in the directory
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let file_path = entry.path();
         
         if file_path.extension().and_then(|s| s.to_str()) == Some("dat") {
             let dat = parse_dat_file(&file_path)?;
+            
+            // check for duplicate DAT names
+            if dats.iter().any(|existing_dat: &Dat| existing_dat.name == dat.name) {
+                return Err(format!("duplicate DAT, name: {}, file: {}", 
+                    dat.name, file_path.display()).into());
+            }
+            
             dats.push(dat);
         }
     }
@@ -37,96 +43,95 @@ pub fn load_dats(path: &Path) -> Result<Vec<DAT>, Box<dyn Error>> {
     Ok(dats)
 }
 
-fn parse_dat_file(file_path: &Path) -> Result<DAT, Box<dyn Error>> {
+fn parse_dat_file(file_path: &Path) -> Result<Dat, Box<dyn Error>> {
     let file = File::open(file_path)?;
     let buf_reader = BufReader::new(file);
-    let mut reader = Reader::from_reader(buf_reader);
-    reader.config_mut().trim_text(true);
+    let mut xml_reader = Reader::from_reader(buf_reader);
+    xml_reader.config_mut().trim_text(true);
     
-    let mut dat = DAT {
-        name: String::new(),
-        games: Vec::new(),
-    };
+    let mut dat = Dat { name: String::new(), games: Vec::new() };
     
-    let mut current_game: Option<Game> = None;
-    let mut in_header_name = false;
+    let mut path_stack: Vec<String> = Vec::new();
+    let mut game: Option<Game> = None;
+
     let mut buf = Vec::new();
-    
     loop {
-        match reader.read_event_into(&mut buf)? {
+        match xml_reader.read_event_into(&mut buf)? {
             Event::Start(ref e) => {
-                match e.name().as_ref() {
-                    b"name" => {
-                        // Check if we're in header (no current game means we're in header)
-                        if current_game.is_none() {
-                            in_header_name = true;
-                        }
+                let element_name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                path_stack.push(element_name);
+                
+                let path = path_stack.join(".");
+                if path == "datafile.game" {
+                    if let Some(name_attr) = e.attributes().find(|a| 
+                        a.as_ref().map_or(false, |attr| attr.key.as_ref() == b"name")
+                    ) {
+                        let name = String::from_utf8_lossy(&name_attr.unwrap().value).into_owned();
+                        game = Some(Game { name, roms: Vec::new() });
                     }
-                    b"game" => {
-                        // Extract game name from attributes
-                        if let Some(name_attr) = e.attributes().find(|a| 
-                            a.as_ref().map_or(false, |attr| attr.key.as_ref() == b"name")
-                        ) {
-                            let name = String::from_utf8_lossy(&name_attr.unwrap().value).into_owned();
-                            current_game = Some(Game {
-                                name,
-                                roms: Vec::new(),
-                            });
-                        }
-                    }
-                    _ => {}
+                } else if path == "datafile.game.rom" {
+                    process_rom_element(e, &mut game);
                 }
             }
+
             Event::Empty(ref e) => {
-                match e.name().as_ref() {
-                    b"rom" => {
-                        if let Some(ref mut game) = current_game {
-                            let mut rom_name = String::new();
-                            let mut rom_sha1 = String::new();
-                            
-                            // Parse attributes in one pass
-                            for attr_result in e.attributes() {
-                                if let Ok(attr) = attr_result {
-                                    match attr.key.as_ref() {
-                                        b"name" => rom_name = String::from_utf8_lossy(&attr.value).into_owned(),
-                                        b"sha1" => rom_sha1 = String::from_utf8_lossy(&attr.value).into_owned(),
-                                        _ => {} // Skip other attributes
-                                    }
-                                }
-                            }
-                            
-                            game.roms.push(Rom {
-                                name: rom_name,
-                                sha1: rom_sha1,
-                            });
-                        }
-                    }
-                    _ => {}
+                let element_name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                path_stack.push(element_name);
+
+                let path = path_stack.join(".");
+                if path == "datafile.game.rom" {
+                    process_rom_element(e, &mut game);
                 }
+                
+                path_stack.pop();
             }
+
             Event::Text(ref e) => {
-                if in_header_name {
+                let path = path_stack.join(".");
+                if path == "datafile.header.name" {
                     dat.name = e.unescape()?.into_owned();
                 }
             }
-            Event::End(ref e) => {
-                match e.name().as_ref() {
-                    b"name" => {
-                        in_header_name = false;
+
+            Event::End(_) => {
+                let path = path_stack.join(".");
+                if path == "datafile.game" {
+                    if let Some(game) = game.take() {
+                        dat.games.push(game);
                     }
-                    b"game" => {
-                        if let Some(game) = current_game.take() {
-                            dat.games.push(game);
-                        }
-                    }
-                    _ => {}
                 }
+                
+                path_stack.pop();
             }
+
             Event::Eof => break,
-            _ => {} // Skip all other events
+
+            _ => {}
         }
+
+
+        
         buf.clear();
     }
     
     Ok(dat)
+}
+
+fn process_rom_element(e: &quick_xml::events::BytesStart, game: &mut Option<Game>) {
+    if let Some(game) = game {
+        let mut rom_name = String::new();
+        let mut rom_sha1 = String::new();
+        
+        for attr_result in e.attributes() {
+            if let Ok(attr) = attr_result {
+                match attr.key.as_ref() {
+                    b"name" => rom_name = String::from_utf8_lossy(&attr.value).into_owned(),
+                    b"sha1" => rom_sha1 = String::from_utf8_lossy(&attr.value).into_owned(),
+                    _ => {}
+                }
+            }
+        }
+        
+        game.roms.push(Rom { name: rom_name, sha1: rom_sha1 });
+    }
 }

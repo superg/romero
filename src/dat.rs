@@ -29,20 +29,6 @@ pub fn load_dats(path: &Path) -> Result<Vec<Dat>, Box<dyn Error>> {
 
         if file_path.extension().and_then(|s| s.to_str()) == Some("dat") {
             let dat = parse_dat_file(&file_path)?;
-
-            // check for duplicate DAT names
-            if dats
-                .iter()
-                .any(|existing_dat: &Dat| existing_dat.name == dat.name)
-            {
-                return Err(format!(
-                    "duplicate DAT, name: {}, file: {}",
-                    dat.name,
-                    file_path.display()
-                )
-                .into());
-            }
-
             dats.push(dat);
         }
     }

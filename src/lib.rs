@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::path::Path;
 
+mod dat;
+
 // --dat-dir
 // --work-dir
 // --archive-dir
@@ -50,6 +52,13 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     validate_directory(dat_path)?;
     validate_directory(work_path)?;
     validate_directory(archive_path)?;
+
+    let dats = dat::load_dats(dat_path)?;
+
+    println!("Loaded {} DAT files", dats.len());
+    for dat in &dats {
+        println!("DAT: {} with {} games", dat.name, dat.games.len());
+    }
 
     println!("Hello, world!");
 

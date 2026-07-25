@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  initialize:
+    name: Validate tag and create draft
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate semantic tag, crate version, and main commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
+          crate_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "v${crate_version}" = "$GITHUB_REF_NAME"
+          git fetch --no-tags origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = "true"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --draft \
+              --title "$GITHUB_REF_NAME"
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: initialize
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            binary: romero
+          - os: windows-2025
+            target: i686-pc-windows-msvc
+            binary: romero.exe
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: romero.exe
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: romero
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: romero
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install stable Rust target
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Test target
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package and upload Unix binary
+        if: runner.os != 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="romero-${GITHUB_REF_NAME}-${{ matrix.target }}.zip"
+          zip -j "$archive" "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          test "$(zipinfo -1 "$archive" | wc -l | tr -d ' ')" = "1"
+          gh release upload "$GITHUB_REF_NAME" "$archive" --clobber
+      - name: Package and upload Windows binary
+        if: runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $archive = "romero-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+          Compress-Archive `
+            -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
+            -DestinationPath $archive
+          $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            if ($zip.Entries.Count -ne 1 -or $zip.Entries[0].FullName -ne "${{ matrix.binary }}") {
+              throw "release ZIP must contain exactly the Romero binary at its root"
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          gh release upload $env:GITHUB_REF_NAME $archive --clobber
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Verify the exact release asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(
+            printf '%s\n' \
+              "romero-${GITHUB_REF_NAME}-aarch64-apple-darwin.zip" \
+              "romero-${GITHUB_REF_NAME}-i686-pc-windows-msvc.zip" \
+              "romero-${GITHUB_REF_NAME}-x86_64-apple-darwin.zip" \
+              "romero-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip" \
+              "romero-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.zip"
+          )"
+          actual="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | sort)"
+          test "$actual" = "$expected"
+      - name: Publish completed draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

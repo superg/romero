@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use romero::{ProgressEvent, ProgressMoveKind, ProgressRemovalKind};
+use romero::ProgressEvent;
+
+mod presentation;
+
+use presentation::verbose_only;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -52,41 +56,6 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("romero: {error}");
             ExitCode::FAILURE
-        }
-    }
-}
-
-fn verbose_only(event: &ProgressEvent) -> bool {
-    matches!(
-        event,
-        ProgressEvent::HashSaved { .. }
-            | ProgressEvent::CacheCommitted { .. }
-            | ProgressEvent::CacheHit { .. }
-            | ProgressEvent::Moving {
-                kind: ProgressMoveKind::Promotion,
-                ..
-            }
-            | ProgressEvent::WritingCue { .. }
-            | ProgressEvent::Removing {
-                kind: ProgressRemovalKind::RewrittenCueSource,
-                ..
-            }
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use romero::CacheCommitReason;
-
-    use super::*;
-
-    #[test]
-    fn cache_commit_progress_is_verbose_only_for_every_reason() {
-        for reason in [
-            CacheCommitReason::PeriodicCheckpoint,
-            CacheCommitReason::RunComplete,
-        ] {
-            assert!(verbose_only(&ProgressEvent::CacheCommitted { reason }));
         }
     }
 }

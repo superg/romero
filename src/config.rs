@@ -1,10 +1,10 @@
-use std::fs;
-use std::io::ErrorKind;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
 
 use crate::error::{Result, RomeroError};
+use crate::filesystem::{EntryKind, FileSystem, OsFileSystem};
 
 const CONFIG_NAME: &str = "romero.yaml";
 const DATABASE_NAME: &str = ".romero.sqlite3";
@@ -58,9 +58,8 @@ impl ConfigValues {
             return Ok(Self::default());
         }
 
-        let options = serde_saphyr::Options {
+        let options = serde_saphyr::options! {
             no_schema: true,
-            ..serde_saphyr::Options::default()
         };
         serde_saphyr::from_str_with_options(yaml, options)
             .map_err(|error| RomeroError::Config(format!("invalid {CONFIG_NAME}: {error}")))
@@ -122,41 +121,45 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     pub fn load(root: &Path) -> Result<Self> {
-        let root_metadata = fs::metadata(root).map_err(|error| match error.kind() {
-            ErrorKind::NotFound => {
-                RomeroError::InvalidRoot(format!("root does not exist: {}", root.display()))
-            }
-            _ => RomeroError::io_path("cannot inspect root", root, error),
+        Self::load_with_filesystem(&OsFileSystem, root)
+    }
+
+    fn load_with_filesystem<F: FileSystem>(filesystem: &F, root: &Path) -> Result<Self> {
+        let Some(canonical_root) = filesystem.canonicalize(root)? else {
+            return Err(RomeroError::InvalidRoot(format!(
+                "root does not exist: {}",
+                root.display()
+            )));
+        };
+        let root_metadata = filesystem.metadata(&canonical_root)?.ok_or_else(|| {
+            RomeroError::InvalidRoot(format!("root does not exist: {}", root.display()))
         })?;
-        if !root_metadata.is_dir() {
+        if root_metadata.kind != EntryKind::Directory {
             return Err(RomeroError::InvalidRoot(format!(
                 "root is not a directory: {}",
                 root.display()
             )));
         }
 
-        let root = fs::canonicalize(root)
-            .map_err(|error| RomeroError::io_path("cannot canonicalize root", root, error))?;
+        let root = canonical_root;
         let config_path = root.join(CONFIG_NAME);
-        let yaml = match fs::symlink_metadata(&config_path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
+        let yaml = match filesystem.metadata(&config_path)? {
+            Some(metadata) => {
+                if metadata.kind != EntryKind::File {
                     return Err(RomeroError::Config(format!(
                         "{CONFIG_NAME} must be a regular file"
                     )));
                 }
-                Some(fs::read_to_string(&config_path).map_err(|error| {
-                    RomeroError::io_path("cannot read configuration", &config_path, error)
+                let bytes = filesystem.read(&config_path)?;
+                Some(String::from_utf8(bytes).map_err(|error| {
+                    RomeroError::io_path(
+                        "cannot read configuration",
+                        &config_path,
+                        io::Error::new(io::ErrorKind::InvalidData, error),
+                    )
                 })?)
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(RomeroError::io_path(
-                    "cannot inspect configuration",
-                    &config_path,
-                    error,
-                ));
-            }
+            None => None,
         };
 
         let values = ConfigValues::from_yaml(yaml.as_deref())?.normalized()?;
@@ -164,7 +167,7 @@ impl ResolvedConfig {
         let work_path = root.join(&values.work_path);
         let dat_path = root.join(&values.dat_path);
         for path in [&library_path, &work_path, &dat_path] {
-            inspect_managed_directory(&root, path)?;
+            inspect_managed_directory(filesystem, &root, path)?;
         }
 
         Ok(Self {
@@ -177,13 +180,15 @@ impl ResolvedConfig {
     }
 
     pub(crate) fn prepare_managed_directories(&self) -> Result<()> {
+        self.prepare_managed_directories_with(&OsFileSystem)
+    }
+
+    fn prepare_managed_directories_with<F: FileSystem>(&self, filesystem: &F) -> Result<()> {
         for path in [&self.library_path, &self.work_path, &self.dat_path] {
-            inspect_managed_directory(&self.root, path)?;
+            inspect_managed_directory(filesystem, &self.root, path)?;
         }
         for path in [&self.library_path, &self.work_path, &self.dat_path] {
-            fs::create_dir_all(path).map_err(|error| {
-                RomeroError::io_path("cannot create managed directory", path, error)
-            })?;
+            filesystem.create_directory_all(path)?;
         }
         Ok(())
     }
@@ -234,7 +239,11 @@ fn normalize_relative(name: &str, path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn inspect_managed_directory(root: &Path, path: &Path) -> Result<()> {
+fn inspect_managed_directory<F: FileSystem>(
+    filesystem: &F,
+    root: &Path,
+    path: &Path,
+) -> Result<()> {
     let relative = path.strip_prefix(root).map_err(|_| {
         RomeroError::Config(format!(
             "managed path escapes the Romero root: {}",
@@ -247,28 +256,20 @@ fn inspect_managed_directory(root: &Path, path: &Path) -> Result<()> {
             unreachable!("relative path was normalized before directory preparation");
         };
         current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+        match filesystem.metadata(&current)? {
+            Some(metadata) if metadata.kind == EntryKind::Symlink => {
                 return Err(RomeroError::Config(format!(
                     "managed path contains a symlink: {}",
                     current.display()
                 )));
             }
-            Ok(metadata) if !metadata.is_dir() => {
+            Some(metadata) if metadata.kind != EntryKind::Directory => {
                 return Err(RomeroError::Config(format!(
                     "managed path component is not a directory: {}",
                     current.display()
                 )));
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(RomeroError::io_path(
-                    "cannot inspect managed path",
-                    &current,
-                    error,
-                ));
-            }
+            Some(_) | None => {}
         }
     }
 
@@ -277,6 +278,8 @@ fn inspect_managed_directory(root: &Path, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::filesystem::MemoryFileSystem;
+
     use super::*;
 
     #[test]
@@ -369,5 +372,122 @@ mod tests {
             };
             assert!(config.validate().is_err());
         }
+    }
+
+    #[test]
+    fn loads_and_prepares_default_paths_in_memory() {
+        let filesystem = MemoryFileSystem::new(Path::new("/root"));
+
+        let config = ResolvedConfig::load_with_filesystem(&filesystem, Path::new("/root")).unwrap();
+
+        assert_eq!(
+            config,
+            ResolvedConfig {
+                root: PathBuf::from("/root"),
+                library_path: PathBuf::from("/root/library"),
+                work_path: PathBuf::from("/root/work"),
+                dat_path: PathBuf::from("/root/dats"),
+                database_path: PathBuf::from("/root/.romero.sqlite3"),
+            }
+        );
+        assert!(!filesystem.contains("/root/library"));
+        assert!(!filesystem.contains("/root/work"));
+        assert!(!filesystem.contains("/root/dats"));
+
+        config
+            .prepare_managed_directories_with(&filesystem)
+            .unwrap();
+
+        assert!(filesystem.contains("/root/library"));
+        assert!(filesystem.contains("/root/work"));
+        assert!(filesystem.contains("/root/dats"));
+    }
+
+    #[test]
+    fn loads_partial_configuration_and_rejects_invalid_utf8_in_memory() {
+        let filesystem = MemoryFileSystem::new(Path::new("/root"));
+        filesystem.add_file("/root/romero.yaml", b"work_path: intake\n".to_vec());
+
+        let config = ResolvedConfig::load_with_filesystem(&filesystem, Path::new("/root")).unwrap();
+
+        assert_eq!(config.library_path, Path::new("/root/library"));
+        assert_eq!(config.work_path, Path::new("/root/intake"));
+        assert_eq!(config.dat_path, Path::new("/root/dats"));
+
+        filesystem.add_file("/root/romero.yaml", vec![0xff]);
+        assert!(
+            ResolvedConfig::load_with_filesystem(&filesystem, Path::new("/root"))
+                .unwrap_err()
+                .to_string()
+                .contains("cannot read configuration")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_and_non_directory_roots_in_memory() {
+        let filesystem = MemoryFileSystem::new(Path::new("/elsewhere"));
+        let missing =
+            ResolvedConfig::load_with_filesystem(&filesystem, Path::new("/root")).unwrap_err();
+        assert_eq!(missing.to_string(), "root does not exist: /root");
+
+        filesystem.add_file("/root", Vec::new());
+        let file_root =
+            ResolvedConfig::load_with_filesystem(&filesystem, Path::new("/root")).unwrap_err();
+        assert_eq!(file_root.to_string(), "root is not a directory: /root");
+    }
+
+    #[test]
+    fn rejects_non_file_configuration_and_unsafe_managed_components_in_memory() {
+        let directory_config = MemoryFileSystem::new(Path::new("/root"));
+        directory_config.add_directory("/root/romero.yaml");
+        assert!(
+            ResolvedConfig::load_with_filesystem(&directory_config, Path::new("/root"))
+                .unwrap_err()
+                .to_string()
+                .contains("must be a regular file")
+        );
+
+        let symlink_config = MemoryFileSystem::new(Path::new("/root"));
+        symlink_config.add_symlink("/root/romero.yaml");
+        assert!(
+            ResolvedConfig::load_with_filesystem(&symlink_config, Path::new("/root"))
+                .unwrap_err()
+                .to_string()
+                .contains("must be a regular file")
+        );
+
+        let filesystem = MemoryFileSystem::new(Path::new("/root"));
+        filesystem.add_file(
+            "/root/romero.yaml",
+            b"library_path: linked/library\n".to_vec(),
+        );
+        filesystem.add_symlink("/root/linked");
+
+        assert!(
+            ResolvedConfig::load_with_filesystem(&filesystem, Path::new("/root"))
+                .unwrap_err()
+                .to_string()
+                .contains("managed path contains a symlink")
+        );
+        assert!(!filesystem.contains("/root/linked/library"));
+
+        filesystem.add_file("/root/linked", Vec::new());
+        assert!(
+            ResolvedConfig::load_with_filesystem(&filesystem, Path::new("/root"))
+                .unwrap_err()
+                .to_string()
+                .contains("managed path component is not a directory")
+        );
+    }
+
+    #[test]
+    fn invalid_configuration_does_not_prepare_directories_in_memory() {
+        let filesystem = MemoryFileSystem::new(Path::new("/root"));
+        filesystem.add_file("/root/romero.yaml", b"library_path: ../outside\n".to_vec());
+
+        assert!(ResolvedConfig::load_with_filesystem(&filesystem, Path::new("/root")).is_err());
+        assert!(!filesystem.contains("/root/library"));
+        assert!(!filesystem.contains("/root/work"));
+        assert!(!filesystem.contains("/root/dats"));
     }
 }

@@ -41,14 +41,24 @@ impl SqliteCache {
         let connection = Connection::open_with_flags(path, flags).map_err(|error| {
             RomeroError::Cache(format!("cannot open cache {}: {error}", path.display()))
         })?;
+        Self::initialize(
+            connection,
+            "PRAGMA journal_mode = DELETE;
+             PRAGMA synchronous = FULL;",
+            "cannot initialize cache",
+        )
+    }
+
+    fn initialize(connection: Connection, pragmas: &str, error_context: &str) -> Result<Self> {
         connection.busy_timeout(Duration::ZERO).map_err(|error| {
             RomeroError::Cache(format!("cannot configure cache locking: {error}"))
         })?;
         connection
+            .execute_batch(pragmas)
+            .map_err(|error| RomeroError::Cache(format!("{error_context}: {error}")))?;
+        connection
             .execute_batch(
-                "PRAGMA journal_mode = DELETE;
-                 PRAGMA synchronous = FULL;
-                 BEGIN EXCLUSIVE;
+                "BEGIN EXCLUSIVE;
                  CREATE TABLE IF NOT EXISTS files (
                     area TEXT NOT NULL,
                     path TEXT NOT NULL,
@@ -65,7 +75,7 @@ impl SqliteCache {
                 ) {
                     RomeroError::Cache("another Romero process is already running".into())
                 } else {
-                    RomeroError::Cache(format!("cannot initialize cache: {error}"))
+                    RomeroError::Cache(format!("{error_context}: {error}"))
                 }
             })?;
         Ok(Self {
@@ -78,25 +88,13 @@ impl SqliteCache {
     pub(crate) fn in_memory() -> Result<Self> {
         let connection = Connection::open_in_memory()
             .map_err(|error| RomeroError::Cache(format!("cannot open memory cache: {error}")))?;
-        connection
-            .execute_batch(
-                "BEGIN EXCLUSIVE;
-                 CREATE TABLE files (
-                    area TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL,
-                    sha1 TEXT NOT NULL,
-                    PRIMARY KEY (area, path)
-                 );",
-            )
-            .map_err(|error| {
-                RomeroError::Cache(format!("cannot initialize memory cache: {error}"))
-            })?;
-        Ok(Self {
+        Self::initialize(
             connection,
-            transaction_open: true,
-        })
+            "PRAGMA journal_mode = MEMORY;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA synchronous = OFF;",
+            "cannot initialize memory cache",
+        )
     }
 }
 
@@ -307,5 +305,92 @@ mod tests {
         let key = relative_cache_key(Path::new("Sony - PlayStation/Game.bin"));
         assert!(!key.contains("/home"));
         assert!(!key.contains("C:\\"));
+    }
+
+    #[test]
+    fn retain_removes_only_unseen_records() {
+        let mut cache = SqliteCache::in_memory().unwrap();
+        let kept = CacheRecord {
+            area: "work".into(),
+            path: relative_cache_key(Path::new("kept.bin")),
+            size: 1,
+            modified_ns: 1,
+            sha1: "1".repeat(40),
+        };
+        let removed = CacheRecord {
+            path: relative_cache_key(Path::new("removed.bin")),
+            ..kept.clone()
+        };
+        cache.put(&kept).unwrap();
+        cache.put(&removed).unwrap();
+        let seen = BTreeSet::from([(kept.area.clone(), kept.path.clone())]);
+
+        assert!(cache.retain(&seen).unwrap());
+        assert_eq!(cache.get(&kept.area, &kept.path).unwrap(), Some(kept));
+        assert_eq!(cache.get(&removed.area, &removed.path).unwrap(), None);
+        assert!(!cache.retain(&seen).unwrap());
+    }
+
+    #[test]
+    fn rejects_sizes_outside_sqlite_integer_range() {
+        let mut cache = SqliteCache::in_memory().unwrap();
+        let oversized = CacheRecord {
+            area: "work".into(),
+            path: relative_cache_key(Path::new("large.bin")),
+            size: u64::MAX,
+            modified_ns: 1,
+            sha1: "1".repeat(40),
+        };
+        assert!(
+            cache
+                .put(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("too large")
+        );
+
+        cache
+            .connection
+            .execute(
+                "INSERT INTO files (area, path, size, modified_ns, sha1)
+                 VALUES ('work', 'negative', -1, 1, 'hash')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            cache
+                .get("work", "negative")
+                .unwrap_err()
+                .to_string()
+                .contains("negative cached file size")
+        );
+    }
+
+    #[test]
+    fn in_memory_cache_forces_sqlite_temporary_storage_to_memory() {
+        let cache = SqliteCache::in_memory().unwrap();
+        let temp_store: i64 = cache
+            .connection
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(temp_store, 2);
+    }
+
+    #[test]
+    fn busy_and_locked_sqlite_errors_use_the_concurrent_run_message() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert_eq!(
+                cache_lock_error(error).to_string(),
+                "another Romero process is already running"
+            );
+        }
+
+        let error = rusqlite::Error::InvalidQuery;
+        assert!(
+            cache_lock_error(error)
+                .to_string()
+                .contains("cache operation failed")
+        );
     }
 }

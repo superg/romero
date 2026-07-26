@@ -1,3 +1,5 @@
+extern crate self as romero;
+
 mod cache;
 mod config;
 mod cue;
@@ -7,6 +9,8 @@ mod error;
 mod filesystem;
 mod model;
 mod ordering;
+#[cfg(test)]
+mod presentation;
 mod reconcile;
 
 pub use config::{ConfigValues, ResolvedConfig};

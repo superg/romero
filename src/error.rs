@@ -49,3 +49,40 @@ impl Error for RomeroError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_errors_display_their_messages_without_sources() {
+        for error in [
+            RomeroError::InvalidRoot("root".into()),
+            RomeroError::Config("config".into()),
+            RomeroError::Dat("dat".into()),
+            RomeroError::Cache("cache".into()),
+            RomeroError::Operational("operation".into()),
+        ] {
+            assert!(error.source().is_none());
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn io_errors_include_the_action_path_and_source() {
+        let error = RomeroError::io_path(
+            "cannot read",
+            Path::new("/root/file"),
+            io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        );
+
+        assert_eq!(error.to_string(), "cannot read /root/file: denied");
+        assert_eq!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+    }
+}

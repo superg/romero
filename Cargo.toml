@@ -2,23 +2,21 @@
 name = "romero"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.97.1"
+autotests = false
 description = "Conservative ROM set reconciliation against Logiqx DAT catalogs"
 license = "GPL-3.0-or-later"
 
 [dependencies]
 anstream = "1.0.0"
 atomic-write-file = "0.3.0"
-clap = { version = "4.6.2", features = ["derive"] }
-quick-xml = "0.39.2"
-rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde-saphyr = "0.0.10"
-sha1 = "0.10.6"
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
-
-[dev-dependencies]
-tempfile = "3.27.0"
+clap = { version = "4.6.4", features = ["derive"] }
+quick-xml = "0.41.0"
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "0.0.29"
+sha1 = "0.11.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
 panic = "abort"

@@ -28,4 +28,13 @@ mod tests {
 
         assert_eq!(values, ["ALPHA", "alpha", "apple", "Beta", "Zulu"]);
     }
+
+    #[test]
+    fn os_and_path_order_use_the_same_text_policy() {
+        assert_eq!(os(OsStr::new("Alpha"), OsStr::new("alpha")), Ordering::Less);
+        assert_eq!(
+            path(Path::new("Zulu.bin"), Path::new("alpha.bin")),
+            Ordering::Greater
+        );
+    }
 }

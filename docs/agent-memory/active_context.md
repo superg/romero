@@ -2,14 +2,16 @@
 
 Romero is implemented as a Rust 2024 library and CLI. `romero [--verbose] [ROOT]` uses an explicit existing directory or the current directory, reads only optional `ROOT/romero.yaml`, applies defaults for omitted settings, rejects non-string and unsafe paths, validates DAT input, and then creates missing managed directories.
 
+The dependency baseline uses the latest stable crate releases as of 2026-07-25 and Rust 1.97.1. Direct versions are `anstream` 1.0.0, `atomic-write-file` 0.3.0, `clap` 4.6.4, `quick-xml` 0.41.0, `rusqlite` 0.40.1, `serde` 1.0.229, `serde-saphyr` 0.0.29, `sha1` 0.11.0, and `zip` 8.6.0. There are no development dependencies. Prerelease-only `serde-saphyr` 1.0.0-rc.1 and `zip` 9.0.0-pre2 are intentionally excluded.
+
 The repository includes a root-level `romero.yaml` example using the default `library`, `work`, and `dats` paths.
 
 The engine is split across:
 
-- `config.rs`: pure configuration merge/path validation plus production root and symlink inspection.
-- `dat.rs`: direct Logiqx DAT and in-memory ZIP entry loading, catalog validation, and newest-catalog selection.
+- `config.rs`: pure configuration merge/path validation plus root and managed-path inspection through the production or in-memory filesystem adapter.
+- `dat.rs`: filesystem-adapted direct Logiqx DAT and in-memory ZIP entry loading, catalog validation, and newest-catalog selection.
 - `cache.rs`: rollback-journal SQLite with exclusive transaction locking and root-independent cache keys.
-- `filesystem.rs`: the production OS adapter and the unit-test-only in-memory adapter with injected failures and operation counters.
+- `filesystem.rs`: the thin production OS adapter and the unit-test-only in-memory adapter with injected failures and operation counters.
 - `cue.rs`, `reconcile.rs`, and `model.rs`: pure parsing, filename assignment, collision, multiset, and report logic.
 - `engine.rs`: immutable DAT reverse indexes, the mutable indexed work inventory, one-pass library audit, content-only priority-queue matching, CUE FILE-count acceleration, immediate promotion/reporting, and summaries.
 
@@ -39,4 +41,4 @@ Every cache mutation uses one global fixed 60-second checkpoint scheduler: calcu
 
 Failure or interruption rolls back only the current batch even if completed filesystem operations remain. The next run hashes recent uncached files and repairs stale locations and deletion rows from the filesystem. The practical rollback window is about 60 seconds plus the operation in progress. Concurrent runs still fail immediately because each checkpoint begins another exclusive transaction.
 
-Unit tests use only the in-memory filesystem and SQLite `:memory:`. Operation counters verify that directory scans remain constant across promotions and that every work CUE is read once. Coverage includes FILE-directive counting/indexing, CUE-only inputs, exact-name CUE precedence, same-count alternate selection, fixed queue ordering and ownership, filename-only rejection, complete-over-incomplete selection, cross-system/different-filename library sources, incomplete-source rejection, deterministic source choice, repeated missing hashes, and newly promoted sources. Integration tests use temporary roots and cover CLI defaults/rejections and verbose filtering, immediate stderr diagnostics, plain and ZIP DATs, relocation, timed batching and rollback recovery, symlinks, exclusive locking, production moves, and atomic reports. CI verifies formatting and tests native runner platforms. Release automation validates an annotated matching tag on `main`, builds five targets, uploads exactly five one-binary ZIPs to a draft, verifies the asset set, and publishes it.
+Romero uses source-adjacent library unit tests only; Cargo integration-test auto-discovery is disabled and there is no `tests/` directory or binary test module. Tests use inline data, `MemoryFileSystem`, in-memory readers and ZIP cursors, injected clocks and failures, and SQLite `:memory:` with temporary storage forced to memory. They never invoke the CLI, access the filesystem or network, create temporary files, use external fixtures, mutate process-global state, sleep, launch subprocesses, or use containers. Thin production OS adapters remain untested where exercising them would violate these constraints. Operation counters verify that directory scans remain constant across promotions and that every work CUE is read once. Unit coverage includes configuration/path inspection and preparation, direct and ZIP DAT discovery, cache initialization and lifecycle, progress presentation, FILE-directive counting/indexing, CUE-only inputs, exact-name CUE precedence, same-count alternate selection, fixed queue ordering and ownership, filename-only rejection, complete-over-incomplete selection, cross-system/different-filename library sources, incomplete-source rejection, deterministic source choice, repeated missing hashes, logical root relocation, and newly promoted sources.

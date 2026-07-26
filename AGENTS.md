@@ -13,7 +13,11 @@
 ## Engineering rules
 
 - Follow red-green-refactor whenever a behavior can be expressed as a focused test.
-- Run `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` before completing a change.
+- Use source-adjacent `#[cfg(test)]` unit tests only. Do not add integration tests, end-to-end tests, or a top-level `tests/` directory.
+- Unit tests must not access the filesystem, create temporary files, depend on external fixtures, launch Romero or any other subprocess, mutate process environment or the current directory, access the network, sleep, or use containers.
+- Use inline data, `MemoryFileSystem`, in-memory readers, injected clocks and failures, and SQLite `:memory:` connections for test isolation.
+- Keep production OS adapters thin and untested when testing them would violate these constraints. Delete a noncompliant test rather than retaining it.
+- Run `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --lib` before completing a change.
 
 ## AI context and memory protocol
 

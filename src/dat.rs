@@ -1,61 +1,51 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
 use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use quick_xml::Reader;
 use quick_xml::encoding::Decoder;
 use quick_xml::escape::{resolve_xml_entity, unescape};
 use quick_xml::events::{BytesCData, BytesRef, BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 use zip::ZipArchive;
 
 use crate::error::{Result, RomeroError};
+use crate::filesystem::{EntryKind, FileSystem};
 use crate::model::{DatCatalog, DatDate, GameSpec, RomSpec};
 use crate::ordering;
 
-pub(crate) fn load_selected_dats(dat_path: &Path) -> Result<Vec<DatCatalog>> {
-    match fs::symlink_metadata(dat_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
+pub(crate) fn load_selected_dats<F: FileSystem>(
+    filesystem: &F,
+    dat_path: &Path,
+) -> Result<Vec<DatCatalog>> {
+    match filesystem.metadata(dat_path)? {
+        Some(metadata) if metadata.kind == EntryKind::Symlink => {
             return Err(RomeroError::Dat(format!(
                 "DAT path is a symlink: {}",
                 dat_path.display()
             )));
         }
-        Ok(metadata) if !metadata.is_dir() => {
+        Some(metadata) if metadata.kind != EntryKind::Directory => {
             return Err(RomeroError::Dat(format!(
                 "DAT path is not a directory: {}",
                 dat_path.display()
             )));
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(RomeroError::io_path(
-                "cannot inspect DAT directory",
-                dat_path,
-                error,
-            ));
-        }
+        Some(_) => {}
+        None => return Ok(Vec::new()),
     }
 
     let mut paths = Vec::new();
-    for entry in fs::read_dir(dat_path)
-        .map_err(|error| RomeroError::io_path("cannot read DAT directory", dat_path, error))?
-    {
-        let entry = entry.map_err(|error| {
-            RomeroError::io_path("cannot read DAT directory entry", dat_path, error)
-        })?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| RomeroError::io_path("cannot inspect DAT entry", &path, error))?;
-        if metadata.file_type().is_symlink() {
+    for entry in filesystem.read_directory(dat_path)? {
+        if entry.kind == EntryKind::Symlink {
             return Err(RomeroError::Dat(format!(
                 "DAT directory contains a symlink: {}",
-                path.display()
+                entry.path.display()
             )));
         }
-        if metadata.is_file() && (has_extension(&path, "dat") || has_extension(&path, "zip")) {
-            paths.push(path);
+        if entry.kind == EntryKind::File
+            && (has_extension(&entry.path, "dat") || has_extension(&entry.path, "zip"))
+        {
+            paths.push(entry.path);
         }
     }
     paths.sort_by(|left, right| ordering::path(left, right));
@@ -63,24 +53,26 @@ pub(crate) fn load_selected_dats(dat_path: &Path) -> Result<Vec<DatCatalog>> {
     let mut catalogs = Vec::new();
     for path in paths {
         if has_extension(&path, "dat") {
-            let file = File::open(&path)
-                .map_err(|error| RomeroError::io_path("cannot open DAT", &path, error))?;
+            let file = filesystem.open_reader(&path)?;
             catalogs.push(parse_dat(
                 BufReader::new(file),
                 path.to_string_lossy().into_owned(),
             )?);
         } else {
-            load_zip_dats(&path, &mut catalogs)?;
+            load_zip_dats(filesystem, &path, &mut catalogs)?;
         }
     }
 
     select_catalogs(catalogs)
 }
 
-fn load_zip_dats(path: &Path, catalogs: &mut Vec<DatCatalog>) -> Result<()> {
-    let file = File::open(path)
-        .map_err(|error| RomeroError::io_path("cannot open DAT archive", path, error))?;
-    let mut archive = ZipArchive::new(file).map_err(|error| {
+fn load_zip_dats<F: FileSystem>(
+    filesystem: &F,
+    path: &Path,
+    catalogs: &mut Vec<DatCatalog>,
+) -> Result<()> {
+    let bytes = filesystem.read(path)?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|error| {
         RomeroError::Dat(format!(
             "cannot read DAT archive {}: {error}",
             path.display()
@@ -260,7 +252,7 @@ fn required_attribute(
         })?;
         if attribute.key.as_ref() == key {
             let value = attribute
-                .decode_and_unescape_value(decoder)
+                .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
                 .map_err(|error| RomeroError::Dat(format!("invalid {label} in {source}: {error}")))?
                 .into_owned();
             if value.is_empty() {
@@ -274,7 +266,7 @@ fn required_attribute(
 
 fn decode_text(text: &quick_xml::events::BytesText<'_>, source: &str) -> Result<String> {
     let decoded = text
-        .xml_content()
+        .xml10_content()
         .map_err(|error| RomeroError::Dat(format!("invalid XML text in {source}: {error}")))?;
     unescape(&decoded)
         .map(|text| text.into_owned())
@@ -282,7 +274,7 @@ fn decode_text(text: &quick_xml::events::BytesText<'_>, source: &str) -> Result<
 }
 
 fn decode_cdata(text: &BytesCData<'_>, source: &str) -> Result<String> {
-    text.xml_content()
+    text.xml10_content()
         .map(|text| text.into_owned())
         .map_err(|error| RomeroError::Dat(format!("invalid XML text in {source}: {error}")))
 }
@@ -295,7 +287,7 @@ fn decode_reference(reference: &BytesRef<'_>, source: &str) -> Result<String> {
         return Ok(character.to_string());
     }
     let name = reference
-        .xml_content()
+        .xml10_content()
         .map_err(|error| RomeroError::Dat(format!("invalid XML reference in {source}: {error}")))?;
     resolve_xml_entity(&name)
         .map(str::to_owned)
@@ -360,7 +352,9 @@ fn parse_date(value: &str) -> Option<DatDate> {
 fn days_in_month(year: u16, month: u16) -> u16 {
     match month {
         4 | 6 | 9 | 11 => 30,
-        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) => {
+            29
+        }
         2 => 28,
         _ => 31,
     }
@@ -590,6 +584,13 @@ fn extension_of_name(name: &str, extension: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    use crate::filesystem::MemoryFileSystem;
+
     use super::*;
 
     fn sample(date: &str, games: &str) -> String {
@@ -738,5 +739,112 @@ mod tests {
         let second = parse_dat(Cursor::new(second_xml), "second.dat".into()).unwrap();
 
         assert!(select_catalogs(vec![first, second]).is_err());
+    }
+
+    #[test]
+    fn discovers_direct_dats_from_memory_and_ignores_other_entries() {
+        let filesystem = MemoryFileSystem::new(Path::new("/root"));
+        filesystem.add_directory("/root/dats");
+        filesystem.add_file(
+            "/root/dats/catalog.DAT",
+            sample("2026-07-24 13-57-31", "").into_bytes(),
+        );
+        filesystem.add_file("/root/dats/readme.txt", b"not a DAT".to_vec());
+        filesystem.add_directory("/root/dats/nested.dat");
+        filesystem.add_other("/root/dats/device.zip");
+
+        let catalogs = load_selected_dats(&filesystem, Path::new("/root/dats")).unwrap();
+
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].name, "Sony - PlayStation");
+        assert_eq!(catalogs[0].source, "/root/dats/catalog.DAT");
+    }
+
+    #[test]
+    fn missing_dat_directory_is_an_empty_catalog_set_in_memory() {
+        let filesystem = MemoryFileSystem::new(Path::new("/root"));
+
+        assert!(
+            load_selected_dats(&filesystem, Path::new("/root/dats"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_dat_directory_kinds_and_symlinked_entries_in_memory() {
+        let file_path = MemoryFileSystem::new(Path::new("/root"));
+        file_path.add_file("/root/dats", Vec::new());
+        assert!(
+            load_selected_dats(&file_path, Path::new("/root/dats"))
+                .unwrap_err()
+                .to_string()
+                .contains("not a directory")
+        );
+
+        let symlink_path = MemoryFileSystem::new(Path::new("/root"));
+        symlink_path.add_symlink("/root/dats");
+        assert!(
+            load_selected_dats(&symlink_path, Path::new("/root/dats"))
+                .unwrap_err()
+                .to_string()
+                .contains("DAT path is a symlink")
+        );
+
+        let symlink_entry = MemoryFileSystem::new(Path::new("/root"));
+        symlink_entry.add_directory("/root/dats");
+        symlink_entry.add_symlink("/root/dats/catalog.dat");
+        assert!(
+            load_selected_dats(&symlink_entry, Path::new("/root/dats"))
+                .unwrap_err()
+                .to_string()
+                .contains("contains a symlink")
+        );
+    }
+
+    #[test]
+    fn loads_nested_zip_dat_from_memory_and_sanitizes_its_name() {
+        let xml = sample("2026-07-24 13-57-31", "")
+            .replace("Sony - PlayStation", "Hasbro - VideoNow Jr.");
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("ignored.txt", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"ignored").unwrap();
+        writer
+            .start_file(
+                "nested/catalog.dat",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(xml.as_bytes()).unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+
+        let filesystem = MemoryFileSystem::new(Path::new("/root"));
+        filesystem.add_directory("/root/dats");
+        filesystem.add_file("/root/dats/catalogs.zip", archive);
+
+        let catalogs = load_selected_dats(&filesystem, Path::new("/root/dats")).unwrap();
+
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].name, "Hasbro - VideoNow Jr");
+        assert_eq!(
+            catalogs[0].source,
+            "/root/dats/catalogs.zip:nested/catalog.dat"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_zip_bytes_from_memory() {
+        let filesystem = MemoryFileSystem::new(Path::new("/root"));
+        filesystem.add_directory("/root/dats");
+        filesystem.add_file("/root/dats/catalog.zip", b"not a zip".to_vec());
+
+        assert!(
+            load_selected_dats(&filesystem, Path::new("/root/dats"))
+                .unwrap_err()
+                .to_string()
+                .contains("cannot read DAT archive")
+        );
     }
 }

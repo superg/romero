@@ -368,7 +368,7 @@ pub fn run_with_progress(
     progress(&ProgressEvent::LoadingDats {
         path: relative_to_root(&config.root, &config.dat_path),
     });
-    let catalogs = load_selected_dats(&config.dat_path)?;
+    let catalogs = load_selected_dats(&OsFileSystem, &config.dat_path)?;
     progress(&ProgressEvent::DatsLoaded {
         count: catalogs.len(),
     });
@@ -1344,10 +1344,11 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
                     available_by_key.insert(file.cache_key.clone(), file);
                 }
             }
-            if let Some(file) = work.get_by_name(OsStr::new(&rom.name)) {
-                if !file.is_cue() && !processed_data.contains(&file.cache_key) {
-                    available_by_key.insert(file.cache_key.clone(), file.clone());
-                }
+            if let Some(file) = work.get_by_name(OsStr::new(&rom.name))
+                && !file.is_cue()
+                && !processed_data.contains(&file.cache_key)
+            {
+                available_by_key.insert(file.cache_key.clone(), file.clone());
             }
         }
         let mut available: Vec<_> = available_by_key.into_values().collect();
@@ -1443,11 +1444,11 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
         }
 
         let mut cue_keys = work.cue_keys_for_file_count(game.non_cue_roms().count());
-        if let Some(exact_key) = &exact_key {
-            if let Some(position) = cue_keys.iter().position(|key| key == exact_key) {
-                let exact = cue_keys.remove(position);
-                cue_keys.insert(0, exact);
-            }
+        if let Some(exact_key) = &exact_key
+            && let Some(position) = cue_keys.iter().position(|key| key == exact_key)
+        {
+            let exact = cue_keys.remove(position);
+            cue_keys.insert(0, exact);
         }
         for key in cue_keys {
             if processed_cues.contains(&key) || !work.files.contains_key(&key) {
@@ -1477,23 +1478,23 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
             .into_iter()
             .map(|rom| {
                 if rom.is_cue() {
-                    if let Some((file, target, _)) = &evaluation.cue {
-                        if target.name == rom.name {
-                            return LeftoverMatch {
-                                expected_rom: rom.name,
-                                work_path: Some(work_relative_path(file)),
-                                status: LeftoverStatus::Ok,
-                            };
-                        }
+                    if let Some((file, target, _)) = &evaluation.cue
+                        && target.name == rom.name
+                    {
+                        return LeftoverMatch {
+                            expected_rom: rom.name,
+                            work_path: Some(work_relative_path(file)),
+                            status: LeftoverStatus::Ok,
+                        };
                     }
-                    if let Some((file, target)) = &evaluation.cue_mismatch {
-                        if target.name == rom.name {
-                            return LeftoverMatch {
-                                expected_rom: rom.name,
-                                work_path: Some(work_relative_path(file)),
-                                status: LeftoverStatus::Mismatch,
-                            };
-                        }
+                    if let Some((file, target)) = &evaluation.cue_mismatch
+                        && target.name == rom.name
+                    {
+                        return LeftoverMatch {
+                            expected_rom: rom.name,
+                            work_path: Some(work_relative_path(file)),
+                            status: LeftoverStatus::Mismatch,
+                        };
                     }
                 } else if let Some((source, _)) = evaluation
                     .non_cue
@@ -1863,13 +1864,24 @@ fn hash_reader(mut reader: Box<dyn Read>) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_digest(hasher.finalize().as_ref()))
 }
 
 fn sha1_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex_digest(hasher.finalize().as_ref())
+}
+
+fn hex_digest(digest: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for &byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -2250,6 +2262,94 @@ mod tests {
             }]
         );
         assert_eq!(events[0].to_string(), "Cache committed: run complete");
+    }
+
+    #[test]
+    fn presentation_filters_only_mechanical_progress_events_by_default() {
+        use crate::presentation::verbose_only;
+
+        let path = PathBuf::from("work/file.bin");
+        let destination = PathBuf::from("library/System/file.bin");
+        let verbose_events = [
+            ProgressEvent::HashSaved { path: path.clone() },
+            ProgressEvent::CacheCommitted {
+                reason: CacheCommitReason::PeriodicCheckpoint,
+            },
+            ProgressEvent::CacheCommitted {
+                reason: CacheCommitReason::RunComplete,
+            },
+            ProgressEvent::CacheHit { path: path.clone() },
+            ProgressEvent::Moving {
+                kind: ProgressMoveKind::Promotion,
+                source: path.clone(),
+                destination: destination.clone(),
+            },
+            ProgressEvent::WritingCue {
+                source: path.clone(),
+                destination: destination.clone(),
+            },
+            ProgressEvent::Removing {
+                kind: ProgressRemovalKind::RewrittenCueSource,
+                path: path.clone(),
+            },
+        ];
+        assert!(verbose_events.iter().all(verbose_only));
+
+        let visible_events = [
+            ProgressEvent::LoadingConfiguration {
+                root: PathBuf::from("/root"),
+            },
+            ProgressEvent::LoadingDats {
+                path: PathBuf::from("dats"),
+            },
+            ProgressEvent::DatsLoaded { count: 1 },
+            ProgressEvent::PreparingDirectories,
+            ProgressEvent::OpeningCache {
+                path: PathBuf::from(".romero.sqlite3"),
+            },
+            ProgressEvent::AuditingLibrary,
+            ProgressEvent::ProcessingWork,
+            ProgressEvent::MatchingContent,
+            ProgressEvent::WritingReports,
+            ProgressEvent::Hashing {
+                path: path.clone(),
+                size: 1,
+            },
+            ProgressEvent::Moving {
+                kind: ProgressMoveKind::Quarantine,
+                source: path.clone(),
+                destination: destination.clone(),
+            },
+            ProgressEvent::Moving {
+                kind: ProgressMoveKind::LibraryToWork,
+                source: path.clone(),
+                destination: destination.clone(),
+            },
+            ProgressEvent::PromotingGame {
+                system: "System".into(),
+                game: "Game".into(),
+            },
+            ProgressEvent::CopyingLibraryRom {
+                source: path.clone(),
+                destination: destination.clone(),
+            },
+            ProgressEvent::Incomplete {
+                detail: LeftoverDetail {
+                    system: "System".into(),
+                    game: "Game".into(),
+                    matches: Vec::new(),
+                },
+            },
+            ProgressEvent::WritingReport {
+                path,
+                missing_games: 1,
+            },
+            ProgressEvent::IgnoringWorkEntry {
+                path: destination,
+                kind: "directory".into(),
+            },
+        ];
+        assert!(visible_events.iter().all(|event| !verbose_only(event)));
     }
 
     #[test]
@@ -3685,6 +3785,29 @@ mod tests {
 
         let first = execute(&filesystem, &mut cache, &config, &[]).unwrap();
         let second = execute(&filesystem, &mut cache, &config, &[]).unwrap();
+
+        assert_eq!((first.cache_hits, first.cache_misses), (0, 1));
+        assert_eq!((second.cache_hits, second.cache_misses), (1, 0));
+    }
+
+    #[test]
+    fn cache_records_survive_a_logical_root_relocation() {
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/unknown.bin", b"payload".to_vec());
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let first = execute(&filesystem, &mut cache, &config, &[]).unwrap();
+        filesystem
+            .rename(Path::new("/root"), Path::new("/relocated"))
+            .unwrap();
+        let relocated = ResolvedConfig {
+            root: PathBuf::from("/relocated"),
+            library_path: PathBuf::from("/relocated/library"),
+            work_path: PathBuf::from("/relocated/work"),
+            dat_path: PathBuf::from("/relocated/dats"),
+            database_path: PathBuf::from("/relocated/.romero.sqlite3"),
+        };
+        let second = execute(&filesystem, &mut cache, &relocated, &[]).unwrap();
 
         assert_eq!((first.cache_hits, first.cache_misses), (0, 1));
         assert_eq!((second.cache_hits, second.cache_misses), (1, 0));

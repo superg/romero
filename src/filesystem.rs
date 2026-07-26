@@ -32,6 +32,7 @@ pub(crate) struct FileMetadata {
 }
 
 pub(crate) trait FileSystem {
+    fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
     fn read_directory(&self, path: &Path) -> Result<Vec<DirectoryEntry>>;
     fn create_directory_all(&self, path: &Path) -> Result<()>;
     fn metadata(&self, path: &Path) -> Result<Option<FileMetadata>>;
@@ -47,6 +48,18 @@ pub(crate) trait FileSystem {
 pub(crate) struct OsFileSystem;
 
 impl FileSystem for OsFileSystem {
+    fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>> {
+        match fs::canonicalize(path) {
+            Ok(path) => Ok(Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(RomeroError::io_path(
+                "cannot canonicalize path",
+                path,
+                error,
+            )),
+        }
+    }
+
     fn read_directory(&self, path: &Path) -> Result<Vec<DirectoryEntry>> {
         let mut entries = Vec::new();
         for entry in fs::read_dir(path)
@@ -276,6 +289,14 @@ mod memory {
     }
 
     impl FileSystem for MemoryFileSystem {
+        fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>> {
+            Ok(self
+                .nodes
+                .borrow()
+                .contains_key(path)
+                .then(|| path.to_path_buf()))
+        }
+
         fn read_directory(&self, path: &Path) -> Result<Vec<DirectoryEntry>> {
             self.read_directory_calls
                 .set(self.read_directory_calls.get() + 1);

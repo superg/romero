@@ -66,3 +66,73 @@ impl DatCatalog {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rom(name: &str, size: u64, sha1: &str) -> RomSpec {
+        RomSpec {
+            name: name.into(),
+            size,
+            sha1: sha1.into(),
+        }
+    }
+
+    #[test]
+    fn identifies_cues_and_iterates_non_cue_roms() {
+        let game = GameSpec {
+            name: "Game".into(),
+            roms: vec![
+                rom("Game.CUE", 1, "cue"),
+                rom("Game.bin", 2, "bin"),
+                rom("cue", 3, "plain"),
+            ],
+        };
+
+        assert_eq!(game.cue().map(|rom| rom.name.as_str()), Some("Game.CUE"));
+        assert_eq!(
+            game.non_cue_roms()
+                .map(|rom| rom.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Game.bin", "cue"]
+        );
+    }
+
+    #[test]
+    fn content_multiset_sorts_hashes_and_preserves_duplicates() {
+        let game = GameSpec {
+            name: "Game".into(),
+            roms: vec![
+                rom("third.bin", 1, "b"),
+                rom("first.bin", 1, "a"),
+                rom("second.bin", 1, "a"),
+            ],
+        };
+
+        assert_eq!(game.content_multiset(), ["a", "a", "b"]);
+    }
+
+    #[test]
+    fn semantic_map_normalizes_rom_order_without_changing_games() {
+        let catalog = DatCatalog {
+            name: "System".into(),
+            date: DatDate([2026, 1, 1, 0, 0, 0]),
+            games: vec![GameSpec {
+                name: "Game".into(),
+                roms: vec![
+                    rom("z.bin", 2, "b"),
+                    rom("Alpha.bin", 1, "a"),
+                    rom("alpha.bin", 3, "c"),
+                ],
+            }],
+            source: "memory.dat".into(),
+        };
+
+        let map = catalog.semantic_map();
+        let names: Vec<_> = map["Game"].iter().map(|rom| rom.name.as_str()).collect();
+
+        assert_eq!(names, ["Alpha.bin", "alpha.bin", "z.bin"]);
+        assert_eq!(catalog.games[0].roms[0].name, "z.bin");
+    }
+}

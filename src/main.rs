@@ -35,11 +35,16 @@ fn main() -> ExitCode {
 
     match romero::run_with_progress(&root, |event| {
         if cli.verbose || !verbose_only(event) {
-            if let ProgressEvent::Incomplete { detail } = event {
-                let mut stderr = anstream::stderr();
-                let _ = write!(stderr, "{}", detail.colored());
-            } else {
-                eprintln!("{event}");
+            match event {
+                ProgressEvent::Incomplete { detail } => {
+                    let mut stderr = anstream::stderr();
+                    let _ = write!(stderr, "{}", detail.colored());
+                }
+                ProgressEvent::Duplicate { detail } => {
+                    let mut stderr = anstream::stderr();
+                    let _ = write!(stderr, "{}", detail.colored());
+                }
+                _ => eprintln!("{event}"),
             }
         }
     }) {

@@ -101,6 +101,9 @@ pub enum ProgressEvent {
     Incomplete {
         detail: LeftoverDetail,
     },
+    Duplicate {
+        detail: DuplicateDetail,
+    },
     Removing {
         kind: ProgressRemovalKind,
         path: PathBuf,
@@ -183,6 +186,7 @@ impl Display for ProgressEvent {
                 destination.display()
             ),
             Self::Incomplete { detail } => write!(formatter, "{detail}"),
+            Self::Duplicate { detail } => write!(formatter, "{detail}"),
             Self::Removing { kind, path } => {
                 let reason = match kind {
                     ProgressRemovalKind::RewrittenCueSource => "rewritten CUE source",
@@ -227,6 +231,13 @@ pub struct LeftoverDetail {
     pub matches: Vec<LeftoverMatch>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DuplicateDetail {
+    pub system: String,
+    pub game: String,
+    pub matches: Vec<LeftoverMatch>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecutionSummary {
     pub dats_loaded: u64,
@@ -243,6 +254,7 @@ pub struct ExecutionSummary {
     pub unknown_files: u64,
     pub ignored_work_entries: u64,
     pub leftover_details: Vec<LeftoverDetail>,
+    pub duplicate_details: Vec<DuplicateDetail>,
 }
 
 impl ExecutionSummary {
@@ -284,36 +296,31 @@ impl LeftoverDetail {
     }
 
     fn fmt_with_color(&self, formatter: &mut Formatter<'_>, color: bool) -> fmt::Result {
-        let (incomplete_style, incomplete_reset) = ansi_style(color, ANSI_LIGHT_CYAN);
-        writeln!(
+        fmt_game_detail(
             formatter,
-            "{incomplete_style}Incomplete:{incomplete_reset} {} / {}",
-            self.system, self.game
-        )?;
-        for rom in &self.matches {
-            let (status, status_color) = match rom.status {
-                LeftoverStatus::Ok => ("[OK]", ANSI_GREEN),
-                LeftoverStatus::Library => ("[LIBRARY]", ANSI_YELLOW),
-                LeftoverStatus::Missing => ("[MISSING]", ANSI_RED),
-                LeftoverStatus::Mismatch => ("[MISMATCH]", ANSI_ORANGE),
-            };
-            let (status_style, status_reset) = ansi_style(color, status_color);
-            match (&rom.status, rom.work_path.as_deref()) {
-                (LeftoverStatus::Ok, Some(work_path)) if work_path != rom.expected_rom.as_str() => {
-                    writeln!(
-                        formatter,
-                        "  {} -> {} {status_style}{status}{status_reset}",
-                        rom.expected_rom, work_path
-                    )?;
-                }
-                _ => writeln!(
-                    formatter,
-                    "  {} {status_style}{status}{status_reset}",
-                    rom.expected_rom
-                )?,
-            }
-        }
-        Ok(())
+            color,
+            "Incomplete",
+            &self.system,
+            &self.game,
+            &self.matches,
+        )
+    }
+}
+
+impl DuplicateDetail {
+    pub fn colored(&self) -> impl Display + '_ {
+        ColoredDuplicateDetail(self)
+    }
+
+    fn fmt_with_color(&self, formatter: &mut Formatter<'_>, color: bool) -> fmt::Result {
+        fmt_game_detail(
+            formatter,
+            color,
+            "Duplicate",
+            &self.system,
+            &self.game,
+            &self.matches,
+        )
     }
 }
 
@@ -321,6 +328,51 @@ impl Display for LeftoverDetail {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         self.fmt_with_color(formatter, false)
     }
+}
+
+impl Display for DuplicateDetail {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        self.fmt_with_color(formatter, false)
+    }
+}
+
+fn fmt_game_detail(
+    formatter: &mut Formatter<'_>,
+    color: bool,
+    heading: &str,
+    system: &str,
+    game: &str,
+    matches: &[LeftoverMatch],
+) -> fmt::Result {
+    let (heading_style, heading_reset) = ansi_style(color, ANSI_LIGHT_CYAN);
+    writeln!(
+        formatter,
+        "{heading_style}{heading}:{heading_reset} {system} / {game}"
+    )?;
+    for rom in matches {
+        let (status, status_color) = match rom.status {
+            LeftoverStatus::Ok => ("[OK]", ANSI_GREEN),
+            LeftoverStatus::Library => ("[LIBRARY]", ANSI_YELLOW),
+            LeftoverStatus::Missing => ("[MISSING]", ANSI_RED),
+            LeftoverStatus::Mismatch => ("[MISMATCH]", ANSI_ORANGE),
+        };
+        let (status_style, status_reset) = ansi_style(color, status_color);
+        match (&rom.status, rom.work_path.as_deref()) {
+            (LeftoverStatus::Ok, Some(work_path)) if work_path != rom.expected_rom.as_str() => {
+                writeln!(
+                    formatter,
+                    "  {} -> {} {status_style}{status}{status_reset}",
+                    rom.expected_rom, work_path
+                )?;
+            }
+            _ => writeln!(
+                formatter,
+                "  {} {status_style}{status}{status_reset}",
+                rom.expected_rom
+            )?,
+        }
+    }
+    Ok(())
 }
 
 fn ansi_style(enabled: bool, style: &'static str) -> (&'static str, &'static str) {
@@ -335,6 +387,8 @@ struct ColoredExecutionSummary<'a>(&'a ExecutionSummary);
 
 struct ColoredLeftoverDetail<'a>(&'a LeftoverDetail);
 
+struct ColoredDuplicateDetail<'a>(&'a DuplicateDetail);
+
 impl Display for ColoredExecutionSummary<'_> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         self.0.fmt_with_color(formatter, true)
@@ -342,6 +396,12 @@ impl Display for ColoredExecutionSummary<'_> {
 }
 
 impl Display for ColoredLeftoverDetail<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        self.0.fmt_with_color(formatter, true)
+    }
+}
+
+impl Display for ColoredDuplicateDetail<'_> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         self.0.fmt_with_color(formatter, true)
     }
@@ -1153,7 +1213,8 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
             complete_games,
             &mut processed_data,
             &mut processed_cues,
-        )
+        )?;
+        self.report_duplicate_games(work, complete_games)
     }
 
     fn retain_initial_inventory(
@@ -1323,6 +1384,79 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
                     processed_cues.insert(file.cache_key.clone());
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn report_duplicate_games(
+        &mut self,
+        work: &mut WorkInventory,
+        complete_games: &BTreeSet<GameId>,
+    ) -> Result<()> {
+        let ordered_games = self.dat_index.ordered_games.clone();
+        let mut reported_data = BTreeSet::new();
+        let mut reported_cues = BTreeSet::new();
+        for game_id in ordered_games {
+            if !complete_games.contains(&game_id) {
+                continue;
+            }
+            let game = self.catalogs[game_id.catalog].games[game_id.game].clone();
+            let expected_count = game.non_cue_roms().count();
+            if expected_count == 0 {
+                continue;
+            }
+
+            let mut available_by_key = BTreeMap::new();
+            for rom in game.non_cue_roms() {
+                for file in work.files_for_content(&ContentId::from_rom(rom), true) {
+                    if !reported_data.contains(&file.cache_key) {
+                        available_by_key.insert(file.cache_key.clone(), file);
+                    }
+                }
+            }
+            let mut available: Vec<_> = available_by_key.into_values().collect();
+            available.sort_by(|left, right| {
+                ordering::os(&left.name, &right.name)
+                    .then_with(|| ordering::path(&left.relative_path, &right.relative_path))
+            });
+            let selected_work = assign_partial_work_sources(&game, &available, None);
+            if selected_work.len() != expected_count {
+                continue;
+            }
+
+            let non_cue: Vec<_> = selected_work
+                .into_iter()
+                .map(|(file, target)| (RomSource::Work(file), target))
+                .collect();
+            let (cue, _) = self.select_content_cue(&game, &non_cue, work, &reported_cues)?;
+            if game.cue().is_some() && cue.is_none() {
+                continue;
+            }
+
+            let evaluation = CandidateEvaluation {
+                game: game_id,
+                score: non_cue.len() + usize::from(cue.is_some()),
+                non_cue,
+                cue,
+                cue_mismatch: None,
+                mismatches: Vec::new(),
+                complete: true,
+            };
+            for (source, _) in &evaluation.non_cue {
+                let RomSource::Work(file) = source else {
+                    unreachable!("duplicate detection uses only work sources");
+                };
+                reported_data.insert(file.cache_key.clone());
+            }
+            if let Some((file, _, _)) = &evaluation.cue {
+                reported_cues.insert(file.cache_key.clone());
+            }
+            let detail = self.evaluation_detail(&evaluation);
+            self.emit_duplicate(DuplicateDetail {
+                system: detail.system,
+                game: detail.game,
+                matches: detail.matches,
+            });
         }
         Ok(())
     }
@@ -1540,6 +1674,11 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
     fn emit_incomplete(&mut self, detail: LeftoverDetail) {
         self.summary.leftover_details.push(detail.clone());
         self.report(ProgressEvent::Incomplete { detail });
+    }
+
+    fn emit_duplicate(&mut self, detail: DuplicateDetail) {
+        self.summary.duplicate_details.push(detail.clone());
+        self.report(ProgressEvent::Duplicate { detail });
     }
 
     fn apply_candidate(
@@ -2335,6 +2474,13 @@ mod tests {
             },
             ProgressEvent::Incomplete {
                 detail: LeftoverDetail {
+                    system: "System".into(),
+                    game: "Game".into(),
+                    matches: Vec::new(),
+                },
+            },
+            ProgressEvent::Duplicate {
+                detail: DuplicateDetail {
                     system: "System".into(),
                     game: "Game".into(),
                     matches: Vec::new(),
@@ -3295,6 +3441,7 @@ mod tests {
         assert!(filesystem.contains("/root/work/lone-copy.bin"));
         assert!(filesystem.contains("/root/work/leftover.cue"));
         assert_eq!(summary.remaining_leftovers, 2);
+        assert!(summary.duplicate_details.is_empty());
     }
 
     #[test]
@@ -3315,6 +3462,116 @@ mod tests {
         assert!(filesystem.contains("/root/work/copy.bin"));
         assert!(filesystem.contains("/root/work/unrelated.bin"));
         assert_eq!(summary.promotions, 0);
+        assert_eq!(summary.duplicate_details.len(), 1);
+    }
+
+    #[test]
+    fn reports_a_complete_work_copy_of_a_verified_game_as_duplicate() {
+        let (filesystem, config) = fixture();
+        let expected_cue = b"FILE \"Game.bin\" BINARY\n";
+        let work_cue = b"FILE \"copy.bin\" BINARY\n";
+        filesystem.add_directory("/root/library/System");
+        filesystem.add_file("/root/library/System/Game.bin", b"payload".to_vec());
+        filesystem.add_file("/root/library/System/Game.cue", expected_cue.to_vec());
+        filesystem.add_file("/root/work/copy.bin", b"payload".to_vec());
+        filesystem.add_file("/root/work/copy.cue", work_cue.to_vec());
+        let catalogs = [catalog(vec![GameSpec {
+            name: "Game".into(),
+            roms: vec![rom("Game.cue", expected_cue), rom("Game.bin", b"payload")],
+        }])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+        let mut events = Vec::new();
+
+        let summary =
+            execute_with_progress(&filesystem, &mut cache, &config, &catalogs, &mut |event| {
+                events.push(event.clone())
+            })
+            .unwrap();
+
+        let duplicate = events
+            .iter()
+            .find(|event| event.to_string().starts_with("Duplicate:"))
+            .expect("complete work copy is reported as a duplicate");
+        let duplicate_position = events
+            .iter()
+            .position(|event| event == duplicate)
+            .expect("duplicate event position");
+        let reports_position = events
+            .iter()
+            .position(|event| *event == ProgressEvent::WritingReports)
+            .expect("reports event position");
+        assert!(duplicate_position < reports_position);
+        assert_eq!(
+            duplicate.to_string(),
+            concat!(
+                "Duplicate: System / Game\n",
+                "  Game.bin -> copy.bin [OK]\n",
+                "  Game.cue -> copy.cue [OK]\n",
+            )
+        );
+        assert!(filesystem.contains("/root/work/copy.bin"));
+        assert!(filesystem.contains("/root/work/copy.cue"));
+        assert_eq!(summary.promotions, 0);
+        assert_eq!(summary.remaining_leftovers, 2);
+        assert_eq!(
+            summary.duplicate_details,
+            vec![DuplicateDetail {
+                system: "System".into(),
+                game: "Game".into(),
+                matches: vec![
+                    LeftoverMatch {
+                        expected_rom: "Game.bin".into(),
+                        work_path: Some("copy.bin".into()),
+                        status: LeftoverStatus::Ok,
+                    },
+                    LeftoverMatch {
+                        expected_rom: "Game.cue".into(),
+                        work_path: Some("copy.cue".into()),
+                        status: LeftoverStatus::Ok,
+                    },
+                ],
+            }]
+        );
+        assert!(
+            format!("{}", summary.duplicate_details[0].colored())
+                .contains("\x1b[96mDuplicate:\x1b[0m System / Game")
+        );
+        assert!(!format!("{summary}").contains("Duplicate:"));
+    }
+
+    #[test]
+    fn duplicate_reports_do_not_reuse_the_same_physical_work_file() {
+        let (filesystem, config) = fixture();
+        filesystem.add_directory("/root/library/System");
+        filesystem.add_file("/root/library/System/Alpha Shared.bin", b"shared".to_vec());
+        filesystem.add_file("/root/library/System/Alpha.bin", b"alpha".to_vec());
+        filesystem.add_file("/root/library/System/Beta Shared.bin", b"shared".to_vec());
+        filesystem.add_file("/root/library/System/Beta.bin", b"beta".to_vec());
+        filesystem.add_file("/root/work/shared.bin", b"shared".to_vec());
+        filesystem.add_file("/root/work/alpha.bin", b"alpha".to_vec());
+        filesystem.add_file("/root/work/beta.bin", b"beta".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Alpha".into(),
+                roms: vec![
+                    rom("Alpha Shared.bin", b"shared"),
+                    rom("Alpha.bin", b"alpha"),
+                ],
+            },
+            GameSpec {
+                name: "Beta".into(),
+                roms: vec![rom("Beta Shared.bin", b"shared"), rom("Beta.bin", b"beta")],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.duplicate_details.len(), 1);
+        assert_eq!(summary.duplicate_details[0].game, "Alpha");
+        for filename in ["shared.bin", "alpha.bin", "beta.bin"] {
+            assert!(filesystem.contains(Path::new("/root/work").join(filename)));
+        }
     }
 
     #[test]

@@ -112,6 +112,7 @@ fn verbose_adds_cache_and_per_file_promotion_details() {
     assert!(default_stderr.contains("Promoting game: System / Game"));
     for hidden in [
         "Hash saved:",
+        "Cache committed:",
         "Cache hit:",
         "Moving ROM:",
         "Writing rewritten CUE:",
@@ -137,6 +138,7 @@ fn verbose_adds_cache_and_per_file_promotion_details() {
     );
     let verbose_stderr = String::from_utf8_lossy(&verbose_output.stderr);
     assert!(verbose_stderr.contains("Hash saved: work/download.bin"));
+    assert!(verbose_stderr.contains("Cache committed: run complete"));
     assert!(verbose_stderr.contains("Moving ROM: work/download.bin -> library/System/Game.bin"));
     assert!(
         verbose_stderr
@@ -159,6 +161,7 @@ fn incomplete_games_explain_every_expected_rom_without_work_prefixes() {
     let root = tempdir().unwrap();
     fs::create_dir(root.path().join("work")).unwrap();
     fs::create_dir(root.path().join("dats")).unwrap();
+    fs::create_dir_all(root.path().join("library/System")).unwrap();
     let dat = format!(
         r#"<?xml version="1.0"?>
 <datafile>
@@ -166,14 +169,18 @@ fn incomplete_games_explain_every_expected_rom_without_work_prefixes() {
     <name>System</name>
     <date>2026-07-24 13-57-31</date>
   </header>
-  <game name="Game">{}{}{}{}</game>
+  <game name="Source">{}</game>
+  <game name="Game">{}{}{}{}{}</game>
 </datafile>"#,
+        rom("Source.bin", b"library"),
         rom("Bad.bin", b"expected bad"),
         rom("Exact.bin", b"exact"),
+        rom("Library.bin", b"library"),
         rom("Missing.bin", b"missing"),
         rom("Renamed.bin", b"renamed"),
     );
     fs::write(root.path().join("dats/catalog.dat"), dat).unwrap();
+    fs::write(root.path().join("library/System/Source.bin"), b"library").unwrap();
     fs::write(root.path().join("work/Bad.bin"), b"wrong").unwrap();
     fs::write(root.path().join("work/Exact.bin"), b"exact").unwrap();
     fs::write(root.path().join("work/download.bin"), b"renamed").unwrap();
@@ -189,18 +196,29 @@ fn incomplete_games_explain_every_expected_rom_without_work_prefixes() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(concat!(
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let content_matching = stderr
+        .find("Content matching")
+        .expect("content matching stage is visible");
+    let incomplete = stderr
+        .find("Incomplete: System / Game")
+        .expect("incomplete content result is visible");
+    assert!(content_matching < incomplete);
+    assert!(!stderr.contains("CUE matching"));
+    assert!(stderr.contains(concat!(
         "Incomplete: System / Game\n",
         "  Bad.bin [MISMATCH]\n",
         "  Exact.bin [OK]\n",
+        "  Library.bin [LIBRARY]\n",
         "  Missing.bin [MISSING]\n",
         "  Renamed.bin -> download.bin [OK]\n",
     )));
+    assert!(!stdout.contains("Incomplete:"));
     assert!(!stdout.contains("Leftover game:"));
-    assert!(!stdout.contains("work/download.bin"));
-    assert!(!stdout.contains("match)"));
-    assert!(!stdout.contains("matches)"));
-    assert!(!stdout.contains('\x1b'));
+    assert!(!stderr.contains("Renamed.bin -> work/download.bin"));
+    assert!(!stderr.contains("match)"));
+    assert!(!stderr.contains("matches)"));
+    assert!(!stderr.contains('\x1b'));
 
     let colored_output = Command::new(env!("CARGO_BIN_EXE_romero"))
         .env_remove("NO_COLOR")
@@ -209,9 +227,11 @@ fn incomplete_games_explain_every_expected_rom_without_work_prefixes() {
         .output()
         .unwrap();
     assert!(colored_output.status.success());
-    let colored_stdout = String::from_utf8_lossy(&colored_output.stdout);
-    assert!(colored_stdout.contains("\x1b[33mIncomplete:\x1b[0m System / Game"));
-    assert!(colored_stdout.contains("Exact.bin \x1b[32m[OK]\x1b[0m"));
-    assert!(colored_stdout.contains("Bad.bin \x1b[38;5;208m[MISMATCH]\x1b[0m"));
-    assert!(colored_stdout.contains("Missing.bin \x1b[31m[MISSING]\x1b[0m"));
+    let colored_stderr = String::from_utf8_lossy(&colored_output.stderr);
+    assert!(colored_stderr.contains("\x1b[96mIncomplete:\x1b[0m System / Game"));
+    assert!(colored_stderr.contains("Exact.bin \x1b[32m[OK]\x1b[0m"));
+    assert!(colored_stderr.contains("Library.bin \x1b[33m[LIBRARY]\x1b[0m"));
+    assert!(colored_stderr.contains("Bad.bin \x1b[38;5;208m[MISMATCH]\x1b[0m"));
+    assert!(colored_stderr.contains("Missing.bin \x1b[31m[MISSING]\x1b[0m"));
+    assert!(!String::from_utf8_lossy(&colored_output.stdout).contains("Incomplete:"));
 }

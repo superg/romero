@@ -11,7 +11,7 @@ mod reconcile;
 
 pub use config::{ConfigValues, ResolvedConfig};
 pub use engine::{
-    ExecutionSummary, LeftoverDetail, LeftoverMatch, LeftoverStatus, ProgressEvent,
-    ProgressMoveKind, ProgressRemovalKind, run, run_with_progress,
+    CacheCommitReason, ExecutionSummary, LeftoverDetail, LeftoverMatch, LeftoverStatus,
+    ProgressEvent, ProgressMoveKind, ProgressRemovalKind, run, run_with_progress,
 };
 pub use error::{Result, RomeroError};

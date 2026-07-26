@@ -31,7 +31,12 @@ fn main() -> ExitCode {
 
     match romero::run_with_progress(&root, |event| {
         if cli.verbose || !verbose_only(event) {
-            eprintln!("{event}");
+            if let ProgressEvent::Incomplete { detail } = event {
+                let mut stderr = anstream::stderr();
+                let _ = write!(stderr, "{}", detail.colored());
+            } else {
+                eprintln!("{event}");
+            }
         }
     }) {
         Ok(summary) => {
@@ -55,6 +60,7 @@ fn verbose_only(event: &ProgressEvent) -> bool {
     matches!(
         event,
         ProgressEvent::HashSaved { .. }
+            | ProgressEvent::CacheCommitted { .. }
             | ProgressEvent::CacheHit { .. }
             | ProgressEvent::Moving {
                 kind: ProgressMoveKind::Promotion,
@@ -66,4 +72,21 @@ fn verbose_only(event: &ProgressEvent) -> bool {
                 ..
             }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use romero::CacheCommitReason;
+
+    use super::*;
+
+    #[test]
+    fn cache_commit_progress_is_verbose_only_for_every_reason() {
+        for reason in [
+            CacheCommitReason::PeriodicCheckpoint,
+            CacheCommitReason::RunComplete,
+        ] {
+            assert!(verbose_only(&ProgressEvent::CacheCommitted { reason }));
+        }
+    }
 }

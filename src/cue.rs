@@ -42,6 +42,10 @@ impl CueDocument {
         self.references.keys().map(String::as_str)
     }
 
+    pub fn file_count(&self) -> usize {
+        self.references.values().map(Vec::len).sum()
+    }
+
     pub fn rewrite(&self, replacements: &BTreeMap<String, String>) -> Result<Vec<u8>> {
         let mut edits = Vec::new();
         for (source, spans) in &self.references {
@@ -153,6 +157,17 @@ mod tests {
             rewritten,
             b"FILE \"Final Name.bin\" BINARY\r\n  TRACK 01 MODE2/2352\r\nFILE Final Name.bin BINARY\r\n"
         );
+    }
+
+    #[test]
+    fn file_count_counts_directives_not_distinct_names_or_tracks() {
+        let cue = CueDocument::parse(
+            b"FILE \"shared.bin\" BINARY\n  TRACK 01 AUDIO\n  TRACK 02 AUDIO\nFILE \"shared.bin\" BINARY\nFILE \"other.bin\" BINARY\n",
+        )
+        .unwrap();
+
+        assert_eq!(cue.file_count(), 3);
+        assert_eq!(cue.referenced_names().count(), 2);
     }
 
     #[test]

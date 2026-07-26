@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display, Formatter};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use sha1::{Digest, Sha1};
 
@@ -14,14 +15,13 @@ use crate::error::{Result, RomeroError};
 use crate::filesystem::{DirectoryEntry, EntryKind, FileSystem, OsFileSystem};
 use crate::model::{DatCatalog, GameSpec, RomSpec};
 use crate::ordering;
-use crate::reconcile::{
-    HashedFile, all_assignments, collision_name, deterministic_assignment, game_is_complete,
-    missing_report,
-};
+use crate::reconcile::{HashedFile, collision_name, game_is_complete, missing_report};
 
 const LIBRARY_AREA: &str = "library";
 const WORK_AREA: &str = "work";
+const CACHE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_LIGHT_CYAN: &str = "\x1b[96m";
 const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_RED: &str = "\x1b[31m";
 const ANSI_ORANGE: &str = "\x1b[38;5;208m";
@@ -38,9 +38,14 @@ pub enum ProgressMoveKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ProgressRemovalKind {
-    ExistingGameDuplicate,
-    RedundantLeftover,
     RewrittenCueSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CacheCommitReason {
+    PeriodicCheckpoint,
+    RunComplete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,9 +66,13 @@ pub enum ProgressEvent {
     },
     AuditingLibrary,
     ProcessingWork,
+    MatchingContent,
     WritingReports,
     HashSaved {
         path: PathBuf,
+    },
+    CacheCommitted {
+        reason: CacheCommitReason,
     },
     CacheHit {
         path: PathBuf,
@@ -85,9 +94,12 @@ pub enum ProgressEvent {
         source: PathBuf,
         destination: PathBuf,
     },
-    CopyingRecovery {
+    CopyingLibraryRom {
         source: PathBuf,
         destination: PathBuf,
+    },
+    Incomplete {
+        detail: LeftoverDetail,
     },
     Removing {
         kind: ProgressRemovalKind,
@@ -119,8 +131,17 @@ impl Display for ProgressEvent {
             Self::OpeningCache { path } => write!(formatter, "Opening cache {}", path.display()),
             Self::AuditingLibrary => formatter.write_str("Auditing library"),
             Self::ProcessingWork => formatter.write_str("Processing work directory"),
+            Self::MatchingContent => formatter.write_str("Content matching"),
             Self::WritingReports => formatter.write_str("Writing missing-game reports"),
             Self::HashSaved { path } => write!(formatter, "Hash saved: {}", path.display()),
+            Self::CacheCommitted { reason } => match reason {
+                CacheCommitReason::PeriodicCheckpoint => {
+                    formatter.write_str("Cache committed: periodic checkpoint")
+                }
+                CacheCommitReason::RunComplete => {
+                    formatter.write_str("Cache committed: run complete")
+                }
+            },
             Self::CacheHit { path } => write!(formatter, "Cache hit: {}", path.display()),
             Self::Hashing { path, .. } => write!(formatter, "Hashing {}", path.display()),
             Self::Moving {
@@ -152,19 +173,18 @@ impl Display for ProgressEvent {
                 source.display(),
                 destination.display()
             ),
-            Self::CopyingRecovery {
+            Self::CopyingLibraryRom {
                 source,
                 destination,
             } => write!(
                 formatter,
-                "Copying recovery file: {} -> {}",
+                "Copying library ROM: {} -> {}",
                 source.display(),
                 destination.display()
             ),
+            Self::Incomplete { detail } => write!(formatter, "{detail}"),
             Self::Removing { kind, path } => {
                 let reason = match kind {
-                    ProgressRemovalKind::ExistingGameDuplicate => "existing-game duplicate",
-                    ProgressRemovalKind::RedundantLeftover => "redundant leftover",
                     ProgressRemovalKind::RewrittenCueSource => "rewritten CUE source",
                 };
                 write!(formatter, "Removing {reason}: {}", path.display())
@@ -188,6 +208,7 @@ impl Display for ProgressEvent {
 #[non_exhaustive]
 pub enum LeftoverStatus {
     Ok,
+    Library,
     Missing,
     Mismatch,
 }
@@ -215,9 +236,7 @@ pub struct ExecutionSummary {
     pub quarantined_entries: u64,
     pub quarantined_directories: u64,
     pub promotions: u64,
-    pub recovery_copies: u64,
-    pub existing_duplicates_removed: u64,
-    pub redundant_leftovers_removed: u64,
+    pub library_copies: u64,
     pub complete_games: u64,
     pub missing_games: u64,
     pub remaining_leftovers: u64,
@@ -231,7 +250,7 @@ impl ExecutionSummary {
         ColoredExecutionSummary(self)
     }
 
-    fn fmt_with_color(&self, formatter: &mut Formatter<'_>, color: bool) -> fmt::Result {
+    fn fmt_with_color(&self, formatter: &mut Formatter<'_>, _color: bool) -> fmt::Result {
         writeln!(formatter, "DATs loaded: {}", self.dats_loaded)?;
         writeln!(formatter, "Cache hits: {}", self.cache_hits)?;
         writeln!(formatter, "Cache misses: {}", self.cache_misses)?;
@@ -242,17 +261,7 @@ impl ExecutionSummary {
             self.quarantined_entries, self.quarantined_directories
         )?;
         writeln!(formatter, "Promotions: {}", self.promotions)?;
-        writeln!(formatter, "Recovery copies: {}", self.recovery_copies)?;
-        writeln!(
-            formatter,
-            "Existing-game duplicates removed: {}",
-            self.existing_duplicates_removed
-        )?;
-        writeln!(
-            formatter,
-            "Redundant leftovers removed: {}",
-            self.redundant_leftovers_removed
-        )?;
+        writeln!(formatter, "Library copies: {}", self.library_copies)?;
         writeln!(formatter, "Complete games: {}", self.complete_games)?;
         writeln!(formatter, "Missing games: {}", self.missing_games)?;
         writeln!(
@@ -265,39 +274,52 @@ impl ExecutionSummary {
             "Ignored work entries: {}",
             self.ignored_work_entries
         )?;
-        for leftover in &self.leftover_details {
-            let (incomplete_style, incomplete_reset) = ansi_style(color, ANSI_YELLOW);
-            writeln!(
-                formatter,
-                "{incomplete_style}Incomplete:{incomplete_reset} {} / {}",
-                leftover.system, leftover.game
-            )?;
-            for rom in &leftover.matches {
-                let (status, status_color) = match rom.status {
-                    LeftoverStatus::Ok => ("[OK]", ANSI_GREEN),
-                    LeftoverStatus::Missing => ("[MISSING]", ANSI_RED),
-                    LeftoverStatus::Mismatch => ("[MISMATCH]", ANSI_ORANGE),
-                };
-                let (status_style, status_reset) = ansi_style(color, status_color);
-                match (&rom.status, rom.work_path.as_deref()) {
-                    (LeftoverStatus::Ok, Some(work_path))
-                        if work_path != rom.expected_rom.as_str() =>
-                    {
-                        writeln!(
-                            formatter,
-                            "  {} -> {} {status_style}{status}{status_reset}",
-                            rom.expected_rom, work_path
-                        )?;
-                    }
-                    _ => writeln!(
+        Ok(())
+    }
+}
+
+impl LeftoverDetail {
+    pub fn colored(&self) -> impl Display + '_ {
+        ColoredLeftoverDetail(self)
+    }
+
+    fn fmt_with_color(&self, formatter: &mut Formatter<'_>, color: bool) -> fmt::Result {
+        let (incomplete_style, incomplete_reset) = ansi_style(color, ANSI_LIGHT_CYAN);
+        writeln!(
+            formatter,
+            "{incomplete_style}Incomplete:{incomplete_reset} {} / {}",
+            self.system, self.game
+        )?;
+        for rom in &self.matches {
+            let (status, status_color) = match rom.status {
+                LeftoverStatus::Ok => ("[OK]", ANSI_GREEN),
+                LeftoverStatus::Library => ("[LIBRARY]", ANSI_YELLOW),
+                LeftoverStatus::Missing => ("[MISSING]", ANSI_RED),
+                LeftoverStatus::Mismatch => ("[MISMATCH]", ANSI_ORANGE),
+            };
+            let (status_style, status_reset) = ansi_style(color, status_color);
+            match (&rom.status, rom.work_path.as_deref()) {
+                (LeftoverStatus::Ok, Some(work_path)) if work_path != rom.expected_rom.as_str() => {
+                    writeln!(
                         formatter,
-                        "  {} {status_style}{status}{status_reset}",
-                        rom.expected_rom
-                    )?,
+                        "  {} -> {} {status_style}{status}{status_reset}",
+                        rom.expected_rom, work_path
+                    )?;
                 }
+                _ => writeln!(
+                    formatter,
+                    "  {} {status_style}{status}{status_reset}",
+                    rom.expected_rom
+                )?,
             }
         }
         Ok(())
+    }
+}
+
+impl Display for LeftoverDetail {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        self.fmt_with_color(formatter, false)
     }
 }
 
@@ -311,7 +333,15 @@ fn ansi_style(enabled: bool, style: &'static str) -> (&'static str, &'static str
 
 struct ColoredExecutionSummary<'a>(&'a ExecutionSummary);
 
+struct ColoredLeftoverDetail<'a>(&'a LeftoverDetail);
+
 impl Display for ColoredExecutionSummary<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        self.0.fmt_with_color(formatter, true)
+    }
+}
+
+impl Display for ColoredLeftoverDetail<'_> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         self.0.fmt_with_color(formatter, true)
     }
@@ -351,8 +381,19 @@ pub fn run_with_progress(
     let filesystem = OsFileSystem;
     let summary =
         execute_with_progress(&filesystem, &mut cache, &config, &catalogs, &mut progress)?;
-    cache.commit()?;
+    commit_completed_run(&mut cache, &mut progress)?;
     Ok(summary)
+}
+
+fn commit_completed_run<C: CacheStore>(
+    cache: &mut C,
+    progress: &mut dyn FnMut(&ProgressEvent),
+) -> Result<()> {
+    cache.commit()?;
+    progress(&ProgressEvent::CacheCommitted {
+        reason: CacheCommitReason::RunComplete,
+    });
+    Ok(())
 }
 
 fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
@@ -380,10 +421,6 @@ struct RuntimeFile {
 }
 
 impl RuntimeFile {
-    fn assignment_id(&self) -> String {
-        self.cache_key.clone()
-    }
-
     fn is_cue(&self) -> bool {
         self.absolute_path
             .extension()
@@ -392,117 +429,483 @@ impl RuntimeFile {
     }
 }
 
-fn leftover_diagnostics(
-    game: &GameSpec,
-    assigned_files: &[RuntimeFile],
-    all_work: &[RuntimeFile],
-) -> Vec<LeftoverMatch> {
-    let mut roms: Vec<_> = game.roms.iter().collect();
-    roms.sort_by(|left, right| ordering::text(&left.name, &right.name));
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ContentId {
+    size: u64,
+    sha1: String,
+}
 
-    let mut available: BTreeSet<_> = (0..assigned_files.len()).collect();
-    let mut assignments = BTreeMap::<String, usize>::new();
-
-    for rom in roms.iter().copied().filter(|rom| !rom.is_cue()) {
-        let exact = available.iter().copied().find(|index| {
-            let file = &assigned_files[*index];
-            file.name == OsStr::new(&rom.name) && file.size == rom.size && file.sha1 == rom.sha1
-        });
-        if let Some(index) = exact {
-            available.remove(&index);
-            assignments.insert(rom.name.clone(), index);
+impl ContentId {
+    fn from_file(file: &RuntimeFile) -> Self {
+        Self {
+            size: file.size,
+            sha1: file.sha1.clone(),
         }
     }
 
-    for rom in roms.iter().copied().filter(|rom| !rom.is_cue()) {
-        if assignments.contains_key(&rom.name) {
+    fn from_rom(rom: &RomSpec) -> Self {
+        Self {
+            size: rom.size,
+            sha1: rom.sha1.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GameId {
+    catalog: usize,
+    game: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RomLocation {
+    game: GameId,
+    rom: usize,
+}
+
+struct DatIndex {
+    ordered_games: Vec<GameId>,
+    games_by_content: BTreeMap<ContentId, BTreeSet<GameId>>,
+    roms_by_content: BTreeMap<ContentId, Vec<RomLocation>>,
+}
+
+impl DatIndex {
+    fn new(catalogs: &[DatCatalog]) -> Self {
+        let mut ordered_games = Vec::new();
+        let mut games_by_content = BTreeMap::<ContentId, BTreeSet<GameId>>::new();
+        let mut roms_by_content = BTreeMap::<ContentId, Vec<RomLocation>>::new();
+
+        for (catalog_index, catalog) in catalogs.iter().enumerate() {
+            for (game_index, game) in catalog.games.iter().enumerate() {
+                let game_id = GameId {
+                    catalog: catalog_index,
+                    game: game_index,
+                };
+                ordered_games.push(game_id);
+                for (rom_index, rom) in game.roms.iter().enumerate() {
+                    let content = ContentId::from_rom(rom);
+                    roms_by_content
+                        .entry(content.clone())
+                        .or_default()
+                        .push(RomLocation {
+                            game: game_id,
+                            rom: rom_index,
+                        });
+                    if !rom.is_cue() {
+                        games_by_content.entry(content).or_default().insert(game_id);
+                    }
+                }
+            }
+        }
+
+        ordered_games.sort_by(|left, right| {
+            let left_catalog = &catalogs[left.catalog];
+            let right_catalog = &catalogs[right.catalog];
+            ordering::text(&left_catalog.name, &right_catalog.name).then_with(|| {
+                ordering::text(
+                    &left_catalog.games[left.game].name,
+                    &right_catalog.games[right.game].name,
+                )
+            })
+        });
+        for locations in roms_by_content.values_mut() {
+            locations.sort_by(|left, right| {
+                let left_catalog = &catalogs[left.game.catalog];
+                let right_catalog = &catalogs[right.game.catalog];
+                let left_path = Path::new(&left_catalog.name)
+                    .join(&left_catalog.games[left.game.game].roms[left.rom].name);
+                let right_path = Path::new(&right_catalog.name)
+                    .join(&right_catalog.games[right.game.game].roms[right.rom].name);
+                ordering::path(&left_path, &right_path)
+            });
+        }
+
+        Self {
+            ordered_games,
+            games_by_content,
+            roms_by_content,
+        }
+    }
+
+    fn candidate_games_for_content(&self, content: &ContentId) -> Option<&BTreeSet<GameId>> {
+        self.games_by_content.get(content)
+    }
+}
+
+#[derive(Clone)]
+enum CachedCue {
+    Valid {
+        bytes: Vec<u8>,
+        document: CueDocument,
+    },
+    Invalid {
+        bytes: Vec<u8>,
+    },
+}
+
+struct WorkInventory {
+    files: BTreeMap<String, RuntimeFile>,
+    by_name: BTreeMap<OsString, String>,
+    by_content: BTreeMap<ContentId, BTreeSet<String>>,
+    cues: BTreeMap<String, CachedCue>,
+    cue_keys_by_file_count: BTreeMap<usize, Vec<String>>,
+}
+
+impl WorkInventory {
+    fn new(files: Vec<RuntimeFile>) -> Self {
+        let mut inventory = Self {
+            files: BTreeMap::new(),
+            by_name: BTreeMap::new(),
+            by_content: BTreeMap::new(),
+            cues: BTreeMap::new(),
+            cue_keys_by_file_count: BTreeMap::new(),
+        };
+        for file in files {
+            inventory.insert(file);
+        }
+        inventory
+    }
+
+    fn insert(&mut self, file: RuntimeFile) {
+        let key = file.cache_key.clone();
+        let content = ContentId::from_file(&file);
+        self.by_name.insert(file.name.clone(), key.clone());
+        self.by_content
+            .entry(content)
+            .or_default()
+            .insert(key.clone());
+        self.files.insert(key, file);
+    }
+
+    fn remove(&mut self, key: &str) -> Option<RuntimeFile> {
+        let file = self.files.remove(key)?;
+        self.by_name.remove(&file.name);
+        let content = ContentId::from_file(&file);
+        if let Some(keys) = self.by_content.get_mut(&content) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.by_content.remove(&content);
+            }
+        }
+        if let Some(CachedCue::Valid { document, .. }) = self.cues.remove(key) {
+            let file_count = document.file_count();
+            if let Some(keys) = self.cue_keys_by_file_count.get_mut(&file_count) {
+                keys.retain(|candidate| candidate != key);
+                if keys.is_empty() {
+                    self.cue_keys_by_file_count.remove(&file_count);
+                }
+            }
+        }
+        Some(file)
+    }
+
+    fn get_by_name(&self, name: &OsStr) -> Option<&RuntimeFile> {
+        let key = self.by_name.get(name)?;
+        self.files.get(key)
+    }
+
+    fn sorted_files(&self) -> Vec<&RuntimeFile> {
+        let mut files: Vec<_> = self.files.values().collect();
+        files.sort_by(|left, right| ordering::os(&left.name, &right.name));
+        files
+    }
+
+    fn sorted_non_cue_files(&self) -> Vec<&RuntimeFile> {
+        self.sorted_files()
+            .into_iter()
+            .filter(|file| !file.is_cue())
+            .collect()
+    }
+
+    fn sorted_cue_keys(&self) -> Vec<String> {
+        self.sorted_files()
+            .into_iter()
+            .filter(|file| file.is_cue())
+            .map(|file| file.cache_key.clone())
+            .collect()
+    }
+
+    fn cue_keys_for_file_count(&self, file_count: usize) -> Vec<String> {
+        self.cue_keys_by_file_count
+            .get(&file_count)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn files_for_content(&self, content: &ContentId, non_cue_only: bool) -> Vec<RuntimeFile> {
+        let mut files: Vec<_> = self
+            .by_content
+            .get(content)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.files.get(key))
+            .filter(|file| !non_cue_only || !file.is_cue())
+            .cloned()
+            .collect();
+        files.sort_by(|left, right| {
+            ordering::os(&left.name, &right.name)
+                .then_with(|| ordering::path(&left.relative_path, &right.relative_path))
+        });
+        files
+    }
+
+    fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    fn cache_keys(&self) -> impl Iterator<Item = &String> {
+        self.files.keys()
+    }
+
+    fn load_cue<F: FileSystem>(
+        &mut self,
+        filesystem: &F,
+        key: &str,
+    ) -> Result<(RuntimeFile, Vec<u8>, Option<CueDocument>)> {
+        let file = self
+            .files
+            .get(key)
+            .cloned()
+            .expect("CUE key came from work inventory");
+        if !self.cues.contains_key(key) {
+            let bytes = filesystem.read(&file.absolute_path)?;
+            let cached = match CueDocument::parse(&bytes) {
+                Ok(document) => CachedCue::Valid { bytes, document },
+                Err(_) => CachedCue::Invalid { bytes },
+            };
+            self.cues.insert(key.to_owned(), cached);
+        }
+        Ok(match self.cues.get(key).expect("CUE was cached") {
+            CachedCue::Valid { bytes, document } => (file, bytes.clone(), Some(document.clone())),
+            CachedCue::Invalid { bytes } => (file, bytes.clone(), None),
+        })
+    }
+
+    fn index_cues<F: FileSystem>(&mut self, filesystem: &F) -> Result<()> {
+        self.cue_keys_by_file_count.clear();
+        for key in self.sorted_cue_keys() {
+            let (_, _, document) = self.load_cue(filesystem, &key)?;
+            if let Some(document) = document {
+                self.cue_keys_by_file_count
+                    .entry(document.file_count())
+                    .or_default()
+                    .push(key);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn assign_partial_work_sources(
+    game: &GameSpec,
+    available: &[RuntimeFile],
+    seed: Option<&RuntimeFile>,
+) -> Vec<(RuntimeFile, RomSpec)> {
+    let mut expected_by_content = BTreeMap::<ContentId, Vec<RomSpec>>::new();
+    for rom in game.non_cue_roms() {
+        expected_by_content
+            .entry(ContentId::from_rom(rom))
+            .or_default()
+            .push(rom.clone());
+    }
+    let mut assignments = Vec::new();
+    for (content, mut targets) in expected_by_content {
+        targets.sort_by(|left, right| ordering::text(&left.name, &right.name));
+        let mut sources: Vec<_> = available
+            .iter()
+            .filter(|file| ContentId::from_file(file) == content)
+            .cloned()
+            .collect();
+        sources.sort_by(|left, right| {
+            ordering::os(&left.name, &right.name)
+                .then_with(|| ordering::path(&left.relative_path, &right.relative_path))
+        });
+
+        let mut selected = Vec::new();
+        if let Some(seed) = seed.filter(|seed| ContentId::from_file(seed) == content) {
+            selected.push(seed.clone());
+        }
+        for target in &targets {
+            if selected.len() == targets.len() {
+                break;
+            }
+            if let Some(source) = sources.iter().find(|source| {
+                source.name == OsStr::new(&target.name)
+                    && !selected
+                        .iter()
+                        .any(|selected: &RuntimeFile| selected.cache_key == source.cache_key)
+            }) {
+                selected.push(source.clone());
+            }
+        }
+        for source in sources {
+            if selected.len() == targets.len() {
+                break;
+            }
+            if !selected
+                .iter()
+                .any(|selected| selected.cache_key == source.cache_key)
+            {
+                selected.push(source);
+            }
+        }
+
+        let mut remaining_sources = selected;
+        let mut remaining_targets = targets;
+        let mut exact = Vec::new();
+        let mut target_index = 0;
+        while target_index < remaining_targets.len() {
+            let source_index = remaining_sources.iter().position(|source| {
+                source.name == OsStr::new(&remaining_targets[target_index].name)
+            });
+            if let Some(source_index) = source_index {
+                exact.push((
+                    remaining_sources.remove(source_index),
+                    remaining_targets.remove(target_index),
+                ));
+            } else {
+                target_index += 1;
+            }
+        }
+        exact.extend(remaining_sources.into_iter().zip(remaining_targets));
+        assignments.extend(exact);
+    }
+    assignments.sort_by(|left, right| ordering::text(&left.1.name, &right.1.name));
+    assignments
+}
+
+fn exact_mismatches(
+    game: &GameSpec,
+    available: &[RuntimeFile],
+    assigned_targets: &BTreeSet<String>,
+    selected_keys: &BTreeSet<&str>,
+) -> Vec<(RuntimeFile, RomSpec)> {
+    let mut mismatches = Vec::new();
+    for rom in game.non_cue_roms() {
+        if assigned_targets.contains(&rom.name) {
             continue;
         }
-        let matching = available.iter().copied().find(|index| {
-            let file = &assigned_files[*index];
-            file.size == rom.size && file.sha1 == rom.sha1
-        });
-        if let Some(index) = matching {
-            available.remove(&index);
-            assignments.insert(rom.name.clone(), index);
+        if let Some(file) = available.iter().find(|file| {
+            file.name == OsStr::new(&rom.name)
+                && !selected_keys.contains(file.cache_key.as_str())
+                && (file.size != rom.size || file.sha1 != rom.sha1)
+        }) {
+            mismatches.push((file.clone(), rom.clone()));
         }
     }
+    mismatches.sort_by(|left, right| ordering::text(&left.1.name, &right.1.name));
+    mismatches
+}
 
-    roms.into_iter()
-        .map(|rom| {
-            if rom.is_cue() {
-                let exact = all_work
-                    .iter()
-                    .find(|file| file.name == OsStr::new(&rom.name));
-                return match exact {
-                    Some(file) if file.size == rom.size && file.sha1 == rom.sha1 => LeftoverMatch {
-                        expected_rom: rom.name.clone(),
-                        work_path: Some(work_relative_path(file)),
-                        status: LeftoverStatus::Ok,
-                    },
-                    Some(file) => LeftoverMatch {
-                        expected_rom: rom.name.clone(),
-                        work_path: Some(work_relative_path(file)),
-                        status: LeftoverStatus::Mismatch,
-                    },
-                    None => LeftoverMatch {
-                        expected_rom: rom.name.clone(),
-                        work_path: None,
-                        status: LeftoverStatus::Missing,
-                    },
-                };
-            }
+fn rewrite_selected_cue(
+    cue: &CueDocument,
+    non_cue: &[(RomSource, RomSpec)],
+    expected_cue: &RomSpec,
+) -> Result<Option<Vec<u8>>> {
+    let referenced_names: Vec<_> = cue.referenced_names().collect();
 
-            if let Some(index) = assignments.get(&rom.name) {
-                let file = &assigned_files[*index];
-                LeftoverMatch {
-                    expected_rom: rom.name.clone(),
-                    work_path: Some(work_relative_path(file)),
-                    status: LeftoverStatus::Ok,
-                }
-            } else if let Some(file) = all_work.iter().find(|file| {
-                file.name == OsStr::new(&rom.name)
-                    && (file.size != rom.size || file.sha1 != rom.sha1)
-            }) {
-                LeftoverMatch {
-                    expected_rom: rom.name.clone(),
-                    work_path: Some(work_relative_path(file)),
-                    status: LeftoverStatus::Mismatch,
-                }
-            } else {
-                LeftoverMatch {
-                    expected_rom: rom.name.clone(),
-                    work_path: None,
-                    status: LeftoverStatus::Missing,
+    let mut work_names = BTreeMap::<String, String>::new();
+    let mut library_names = BTreeSet::new();
+    for (source, target) in non_cue {
+        match source {
+            RomSource::Work(file) => {
+                if let Some(name) = file.name.to_str() {
+                    work_names.insert(name.to_owned(), target.name.clone());
                 }
             }
-        })
-        .collect()
+            RomSource::Library(_) => {
+                library_names.insert(target.name.clone());
+            }
+        }
+    }
+    let mut replacements = BTreeMap::new();
+    for source in referenced_names {
+        let target = if let Some(target) = work_names.get(source) {
+            target.clone()
+        } else if library_names.contains(source) {
+            source.to_owned()
+        } else {
+            return Ok(None);
+        };
+        replacements.insert(source.to_owned(), target);
+    }
+    let rewritten = cue.rewrite(&replacements)?;
+    Ok(
+        (rewritten.len() as u64 == expected_cue.size
+            && sha1_bytes(&rewritten) == expected_cue.sha1)
+            .then_some(rewritten),
+    )
 }
 
 fn work_relative_path(file: &RuntimeFile) -> String {
     file.relative_path.to_string_lossy().into_owned()
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct GameKey {
-    system: String,
-    game: String,
-}
-
-#[derive(Clone, Debug, Default)]
-struct LibraryState {
-    complete: BTreeSet<GameKey>,
-    members: Vec<RuntimeFile>,
-    hashes: BTreeSet<String>,
+struct LibraryAudit {
+    complete_games: BTreeSet<GameId>,
+    cache_keys: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
 struct PromotionCandidate {
-    key: GameKey,
+    game: GameId,
     system: String,
-    non_cue: Vec<(RuntimeFile, RomSpec)>,
-    cue: Option<(RuntimeFile, RomSpec, Vec<u8>)>,
+    non_cue: Vec<(RomSource, RomSpec)>,
+    cue: Option<SelectedCue>,
+}
+
+#[derive(Clone, Debug)]
+enum RomSource {
+    Work(RuntimeFile),
+    Library(PathBuf),
+}
+
+type SelectedCue = (RuntimeFile, RomSpec, Vec<u8>);
+type CueMismatch = (RuntimeFile, RomSpec);
+
+#[derive(Clone, Debug)]
+struct CandidateEvaluation {
+    game: GameId,
+    non_cue: Vec<(RomSource, RomSpec)>,
+    cue: Option<SelectedCue>,
+    cue_mismatch: Option<CueMismatch>,
+    mismatches: Vec<(RuntimeFile, RomSpec)>,
+    score: usize,
+    complete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct QueueItem {
+    file: RuntimeFile,
+    candidates: Vec<GameId>,
+}
+
+#[derive(Debug)]
+struct CacheCheckpointScheduler {
+    interval: Duration,
+    dirty_since: Option<Instant>,
+}
+
+impl CacheCheckpointScheduler {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            dirty_since: None,
+        }
+    }
+
+    fn checkpoint_due(&self, now: Instant) -> bool {
+        self.dirty_since
+            .is_some_and(|dirty_since| now.duration_since(dirty_since) >= self.interval)
+    }
+
+    fn mark_dirty(&mut self, now: Instant) {
+        self.dirty_since.get_or_insert(now);
+    }
+
+    fn committed(&mut self) {
+        self.dirty_since = None;
+    }
 }
 
 struct Engine<'a, F, C> {
@@ -510,9 +913,12 @@ struct Engine<'a, F, C> {
     cache: &'a mut C,
     config: &'a ResolvedConfig,
     catalogs: &'a [DatCatalog],
+    dat_index: DatIndex,
     progress: &'a mut dyn FnMut(&ProgressEvent),
+    now: &'a mut dyn FnMut() -> Instant,
     summary: ExecutionSummary,
     accounted_cache_keys: BTreeSet<(String, String)>,
+    cache_checkpoints: CacheCheckpointScheduler,
 }
 
 #[cfg(test)]
@@ -533,32 +939,85 @@ fn execute_with_progress<F: FileSystem, C: CacheStore>(
     catalogs: &[DatCatalog],
     progress: &mut dyn FnMut(&ProgressEvent),
 ) -> Result<ExecutionSummary> {
+    let mut now = Instant::now;
+    execute_with_progress_and_clock(filesystem, cache, config, catalogs, progress, &mut now)
+}
+
+fn execute_with_progress_and_clock<F: FileSystem, C: CacheStore>(
+    filesystem: &F,
+    cache: &mut C,
+    config: &ResolvedConfig,
+    catalogs: &[DatCatalog],
+    progress: &mut dyn FnMut(&ProgressEvent),
+    now: &mut dyn FnMut() -> Instant,
+) -> Result<ExecutionSummary> {
     let mut engine = Engine {
         filesystem,
         cache,
         config,
         catalogs,
+        dat_index: DatIndex::new(catalogs),
         progress,
+        now,
         summary: ExecutionSummary {
             dats_loaded: catalogs.len() as u64,
             ..ExecutionSummary::default()
         },
         accounted_cache_keys: BTreeSet::new(),
+        cache_checkpoints: CacheCheckpointScheduler::new(CACHE_CHECKPOINT_INTERVAL),
     };
 
     engine.report(ProgressEvent::AuditingLibrary);
     engine.quarantine_library_structure()?;
-    engine.audit_library_files()?;
+    let audit = engine.audit_library_files()?;
     engine.report(ProgressEvent::ProcessingWork);
-    engine.process_work()?;
+    let mut work = engine.scan_initial_work()?;
+    engine.retain_initial_inventory(&audit.cache_keys, &work)?;
+    let mut complete_games = audit.complete_games;
+    engine.process_work(&mut work, &mut complete_games)?;
     engine.report(ProgressEvent::WritingReports);
-    engine.finish_reports_and_cache()?;
+    engine.finish_reports(&work, &complete_games)?;
     Ok(engine.summary)
 }
 
 impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
     fn report(&mut self, event: ProgressEvent) {
         (self.progress)(&event);
+    }
+
+    fn prepare_cache_mutation(&mut self) -> Result<Instant> {
+        let now = (self.now)();
+        if self.cache_checkpoints.checkpoint_due(now) {
+            self.cache.checkpoint()?;
+            self.cache_checkpoints.committed();
+            self.report(ProgressEvent::CacheCommitted {
+                reason: CacheCommitReason::PeriodicCheckpoint,
+            });
+        }
+        Ok(now)
+    }
+
+    fn cache_put(&mut self, record: &CacheRecord) -> Result<()> {
+        let now = self.prepare_cache_mutation()?;
+        self.cache.put(record)?;
+        self.cache_checkpoints.mark_dirty(now);
+        Ok(())
+    }
+
+    fn cache_remove(&mut self, area: &str, path: &str) -> Result<()> {
+        let now = self.prepare_cache_mutation()?;
+        if self.cache.remove(area, path)? {
+            self.cache_checkpoints.mark_dirty(now);
+        }
+        Ok(())
+    }
+
+    fn cache_retain(&mut self, seen: &BTreeSet<(String, String)>) -> Result<()> {
+        let now = self.prepare_cache_mutation()?;
+        if self.cache.retain(seen)? {
+            self.cache_checkpoints.mark_dirty(now);
+        }
+        Ok(())
     }
 
     fn progress_path(&self, path: &Path) -> PathBuf {
@@ -595,11 +1054,6 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
             if self.filesystem.metadata(&system_path)?.is_none() {
                 self.filesystem.create_directory_all(&system_path)?;
             }
-            for entry in self.filesystem.read_directory(&system_path)? {
-                if entry.kind != EntryKind::File {
-                    self.quarantine_entry(&entry)?;
-                }
-            }
         }
         Ok(())
     }
@@ -618,107 +1072,119 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
         }
         if let Ok(relative) = entry.path.strip_prefix(&self.config.library_path) {
             let key = relative_cache_key(relative);
-            self.cache.remove(LIBRARY_AREA, &key)?;
+            self.cache_remove(LIBRARY_AREA, &key)?;
         }
-        self.cache.checkpoint()?;
         Ok(())
     }
 
-    fn audit_library_files(&mut self) -> Result<()> {
+    fn audit_library_files(&mut self) -> Result<LibraryAudit> {
+        let mut complete_games = BTreeSet::new();
+        let mut cache_keys = BTreeSet::new();
         for catalog_index in 0..self.catalogs.len() {
             let system = self.catalogs[catalog_index].name.clone();
-            let games = self.catalogs[catalog_index].games.clone();
-            let files = self.scan_system(&system)?;
+            let system_path = self.config.library_path.join(&system);
+            let mut files = Vec::new();
+            for entry in self.filesystem.read_directory(&system_path)? {
+                if entry.kind == EntryKind::File {
+                    files.push(self.hash_file(
+                        LIBRARY_AREA,
+                        &self.config.library_path,
+                        &entry.path,
+                    )?);
+                } else {
+                    self.quarantine_entry(&entry)?;
+                }
+            }
+            files.sort_by(|left, right| ordering::os(&left.name, &right.name));
             let files_by_name = files_by_utf8_name(&files);
             let mut keep = BTreeSet::<OsString>::new();
-            for game in &games {
+            for (game_index, game) in self.catalogs[catalog_index].games.iter().enumerate() {
                 if game_is_complete(game, &files_by_name) {
+                    complete_games.insert(GameId {
+                        catalog: catalog_index,
+                        game: game_index,
+                    });
                     keep.extend(game.roms.iter().map(|rom| OsString::from(&rom.name)));
                 }
             }
 
             for file in files {
-                if !keep.contains(&file.name) {
+                if keep.contains(&file.name) {
+                    cache_keys.insert(file.cache_key.clone());
+                } else {
                     self.move_library_file_to_work(&file)?;
                 }
             }
         }
-        Ok(())
+        Ok(LibraryAudit {
+            complete_games,
+            cache_keys,
+        })
     }
 
-    fn process_work(&mut self) -> Result<()> {
+    fn scan_initial_work(&mut self) -> Result<WorkInventory> {
+        let mut files = Vec::new();
         for entry in self.filesystem.read_directory(&self.config.work_path)? {
-            if entry.kind != EntryKind::File {
+            if entry.kind == EntryKind::File {
+                files.push(self.hash_file(WORK_AREA, &self.config.work_path, &entry.path)?);
+            } else {
+                self.summary.ignored_work_entries += 1;
                 self.report(ProgressEvent::IgnoringWorkEntry {
                     path: self.progress_path(&entry.path),
                     kind: entry_kind_label(entry.kind).to_owned(),
                 });
             }
         }
-
-        let mut attempted_recovery = BTreeSet::new();
-        let mut library = self.read_library_state()?;
-        let mut work = self.scan_work()?;
-        self.checkpoint_scanned_inventory(&library, &work)?;
-
-        loop {
-            if let Some(candidate) = self.find_cue_candidate(&work)? {
-                self.apply_candidate(candidate, &library)?;
-                library = self.read_library_state()?;
-                work = self.scan_work()?;
-                continue;
-            }
-            if let Some(candidate) = self.find_content_candidate(&work, &library)? {
-                self.apply_candidate(candidate, &library)?;
-                library = self.read_library_state()?;
-                work = self.scan_work()?;
-                continue;
-            }
-            if self.try_recovery(&work, &library, &mut attempted_recovery)? {
-                work = self.scan_work()?;
-                continue;
-            }
-            break;
-        }
-
-        library = self.read_library_state()?;
-        self.remove_redundant_leftovers(&library)?;
-        Ok(())
+        files.sort_by(|left, right| ordering::os(&left.name, &right.name));
+        Ok(WorkInventory::new(files))
     }
 
-    fn checkpoint_scanned_inventory(
+    fn process_work(
         &mut self,
-        library: &LibraryState,
-        work: &[RuntimeFile],
+        work: &mut WorkInventory,
+        complete_games: &mut BTreeSet<GameId>,
+    ) -> Result<()> {
+        self.report(ProgressEvent::MatchingContent);
+        work.index_cues(self.filesystem)?;
+        let mut processed_data = BTreeSet::new();
+        let mut processed_cues = BTreeSet::new();
+        self.process_content_queue(
+            work,
+            complete_games,
+            &mut processed_data,
+            &mut processed_cues,
+        )
+    }
+
+    fn retain_initial_inventory(
+        &mut self,
+        library_cache_keys: &BTreeSet<String>,
+        work: &WorkInventory,
     ) -> Result<()> {
         let mut seen = BTreeSet::new();
-        for member in &library.members {
-            seen.insert((LIBRARY_AREA.to_owned(), member.cache_key.clone()));
+        for cache_key in library_cache_keys {
+            seen.insert((LIBRARY_AREA.to_owned(), cache_key.clone()));
         }
-        for file in work {
-            seen.insert((WORK_AREA.to_owned(), file.cache_key.clone()));
+        for cache_key in work.cache_keys() {
+            seen.insert((WORK_AREA.to_owned(), cache_key.clone()));
         }
-        self.cache.retain(&seen)?;
-        self.cache.checkpoint()
+        self.cache_retain(&seen)
     }
 
-    fn finish_reports_and_cache(&mut self) -> Result<()> {
-        let library = self.read_library_state()?;
-        let mut seen = BTreeSet::new();
-        for member in &library.members {
-            seen.insert((LIBRARY_AREA.to_owned(), member.cache_key.clone()));
-        }
-
+    fn finish_reports(
+        &mut self,
+        work: &WorkInventory,
+        complete_games: &BTreeSet<GameId>,
+    ) -> Result<()> {
         let mut complete_count = 0_u64;
         let mut missing_count = 0_u64;
-        for catalog in self.catalogs {
+        for (catalog_index, catalog) in self.catalogs.iter().enumerate() {
             let mut missing = Vec::new();
-            for game in &catalog.games {
-                let key = GameKey {
-                    system: catalog.name.clone(),
-                    game: game.name.clone(),
-                };
-                if library.complete.contains(&key) {
+            for (game_index, game) in catalog.games.iter().enumerate() {
+                if complete_games.contains(&GameId {
+                    catalog: catalog_index,
+                    game: game_index,
+                }) {
                     complete_count += 1;
                 } else {
                     missing_count += 1;
@@ -739,287 +1205,360 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
         }
         self.summary.complete_games = complete_count;
         self.summary.missing_games = missing_count;
-
-        let work_entries = self.filesystem.read_directory(&self.config.work_path)?;
-        self.summary.ignored_work_entries = work_entries
-            .iter()
-            .filter(|entry| entry.kind != EntryKind::File)
-            .count() as u64;
-        let work = self.scan_work()?;
         self.summary.remaining_leftovers = work.len() as u64;
-        self.summary.leftover_details.clear();
-        self.summary.unknown_files = 0;
-        let mut candidates_by_file = BTreeMap::<usize, BTreeSet<(String, String)>>::new();
-
-        for (file_index, file) in work.iter().enumerate() {
-            seen.insert((WORK_AREA.to_owned(), file.cache_key.clone()));
-            if file.is_cue() {
-                continue;
-            }
-            let mut recognized = false;
-            for catalog in self.catalogs {
-                for game in &catalog.games {
-                    if game.non_cue_roms().any(|rom| {
-                        (rom.sha1 == file.sha1 && rom.size == file.size)
-                            || file.name == OsStr::new(&rom.name)
-                    }) {
-                        recognized = true;
-                        candidates_by_file
-                            .entry(file_index)
-                            .or_default()
-                            .insert((catalog.name.clone(), game.name.clone()));
-                    }
-                }
-            }
-            if !recognized {
-                self.summary.unknown_files += 1;
-            }
-        }
-        let mut candidate_group_sizes = BTreeMap::<(String, String), usize>::new();
-        for candidates in candidates_by_file.values() {
-            for group in candidates {
-                *candidate_group_sizes.entry(group.clone()).or_default() += 1;
-            }
-        }
-        let mut leftover_groups = BTreeMap::<(String, String), Vec<RuntimeFile>>::new();
-        for (file_index, candidates) in candidates_by_file {
-            let selected_group = candidates
-                .iter()
-                .min_by(|left, right| {
-                    let left_size = candidate_group_sizes
-                        .get(*left)
-                        .copied()
-                        .unwrap_or_default();
-                    let right_size = candidate_group_sizes
-                        .get(*right)
-                        .copied()
-                        .unwrap_or_default();
-                    right_size.cmp(&left_size).then_with(|| {
-                        ordering::text(&left.0, &right.0)
-                            .then_with(|| ordering::text(&left.1, &right.1))
-                    })
-                })
-                .expect("recognized leftovers have at least one candidate group")
-                .clone();
-            leftover_groups
-                .entry(selected_group)
-                .or_default()
-                .push(work[file_index].clone());
-        }
-        let mut leftover_details: Vec<_> = leftover_groups
+        self.summary.unknown_files = work
+            .sorted_non_cue_files()
             .into_iter()
-            .map(|((system, game_name), files)| {
-                let game = self
-                    .catalogs
-                    .iter()
-                    .find(|catalog| catalog.name == system)
-                    .and_then(|catalog| catalog.games.iter().find(|game| game.name == game_name))
-                    .expect("leftover group came from a selected DAT game");
-                LeftoverDetail {
-                    system,
-                    game: game_name,
-                    matches: leftover_diagnostics(game, &files, &work),
-                }
+            .filter(|file| {
+                self.dat_index
+                    .candidate_games_for_content(&ContentId::from_file(file))
+                    .is_none()
             })
-            .collect();
-        leftover_details.sort_by(|left, right| {
-            ordering::text(&left.system, &right.system)
-                .then_with(|| ordering::text(&left.game, &right.game))
-        });
-        self.summary.leftover_details = leftover_details;
-        self.cache.retain(&seen)?;
+            .count() as u64;
         Ok(())
     }
 
-    fn find_cue_candidate(&mut self, work: &[RuntimeFile]) -> Result<Option<PromotionCandidate>> {
-        let by_name: BTreeMap<OsString, RuntimeFile> = work
-            .iter()
-            .map(|file| (file.name.clone(), file.clone()))
-            .collect();
-
-        for cue_file in work.iter().filter(|file| file.is_cue()) {
-            let bytes = self.filesystem.read(&cue_file.absolute_path)?;
-            let Ok(cue) = CueDocument::parse(&bytes) else {
+    fn process_content_queue(
+        &mut self,
+        work: &mut WorkInventory,
+        complete_games: &mut BTreeSet<GameId>,
+        processed_data: &mut BTreeSet<String>,
+        processed_cues: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let mut queue = Vec::new();
+        for file in work.sorted_non_cue_files() {
+            if processed_data.contains(&file.cache_key) {
+                continue;
+            }
+            let Some(candidates) = self
+                .dat_index
+                .candidate_games_for_content(&ContentId::from_file(file))
+            else {
                 continue;
             };
-            let mut referenced = Vec::new();
-            let mut all_exist = true;
-            for name in cue.referenced_names() {
-                let Some(file) = by_name.get(OsStr::new(name)) else {
-                    all_exist = false;
-                    break;
-                };
-                referenced.push((name.to_owned(), file.clone()));
+            let candidates: Vec<_> = self
+                .dat_index
+                .ordered_games
+                .iter()
+                .copied()
+                .filter(|game_id| candidates.contains(game_id) && !complete_games.contains(game_id))
+                .collect();
+            if !candidates.is_empty() {
+                queue.push(QueueItem {
+                    file: file.clone(),
+                    candidates,
+                });
             }
-            if !all_exist {
+        }
+        queue.sort_by(|left, right| {
+            left.candidates
+                .len()
+                .cmp(&right.candidates.len())
+                .then_with(|| ordering::os(&left.file.name, &right.file.name))
+                .then_with(|| ordering::path(&left.file.relative_path, &right.file.relative_path))
+        });
+
+        for item in queue {
+            if processed_data.contains(&item.file.cache_key)
+                || !work.files.contains_key(&item.file.cache_key)
+            {
                 continue;
             }
-            let source_hashes: Vec<_> = referenced
-                .iter()
-                .map(|(name, file)| (name.clone(), file.sha1.clone()))
-                .collect();
+            let mut evaluations = Vec::new();
+            for game_id in item
+                .candidates
+                .into_iter()
+                .filter(|game_id| !complete_games.contains(game_id))
+            {
+                evaluations.push(self.evaluate_content_candidate(
+                    game_id,
+                    &item.file,
+                    work,
+                    complete_games,
+                    processed_data,
+                    processed_cues,
+                )?);
+            }
+            let Some(winner) = evaluations.into_iter().min_by(|left, right| {
+                match (left.complete, right.complete) {
+                    (true, true) => self.compare_games(left.game, right.game),
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    (false, false) => right
+                        .score
+                        .cmp(&left.score)
+                        .then_with(|| self.compare_games(left.game, right.game)),
+                }
+            }) else {
+                continue;
+            };
 
-            for (catalog_index, game_index) in self.game_indices() {
-                let catalog = &self.catalogs[catalog_index];
-                let game = &catalog.games[game_index];
-                let Some(expected_cue) = game.cue() else {
-                    continue;
-                };
-                let expected: Vec<_> = game.non_cue_roms().collect();
-                for assignment in all_assignments(&source_hashes, &expected) {
-                    let mut selected = Vec::new();
-                    let mut sizes_match = true;
-                    for (source_name, file) in &referenced {
-                        let target_name = &assignment[source_name];
-                        let target = expected
-                            .iter()
-                            .find(|rom| rom.name == *target_name)
-                            .expect("assignment target came from expected ROMs");
-                        if file.size != target.size {
-                            sizes_match = false;
-                            break;
-                        }
-                        selected.push((file.clone(), (*target).clone()));
-                    }
-                    if !sizes_match {
-                        continue;
-                    }
-                    let rewritten = cue.rewrite(&assignment)?;
-                    if rewritten.len() as u64 != expected_cue.size
-                        || sha1_bytes(&rewritten) != expected_cue.sha1
-                    {
-                        continue;
-                    }
-                    return Ok(Some(PromotionCandidate {
-                        key: GameKey {
-                            system: catalog.name.clone(),
-                            game: game.name.clone(),
-                        },
+            if winner.complete {
+                let catalog = &self.catalogs[winner.game.catalog];
+                self.apply_candidate(
+                    PromotionCandidate {
+                        game: winner.game,
                         system: catalog.name.clone(),
-                        non_cue: selected,
-                        cue: Some((cue_file.clone(), expected_cue.clone(), rewritten)),
-                    }));
+                        non_cue: winner.non_cue,
+                        cue: winner.cue,
+                    },
+                    work,
+                    complete_games,
+                )?;
+            } else {
+                self.emit_incomplete(self.evaluation_detail(&winner));
+                processed_data.insert(item.file.cache_key);
+                for (source, _) in &winner.non_cue {
+                    if let RomSource::Work(file) = source {
+                        processed_data.insert(file.cache_key.clone());
+                    }
+                }
+                for (file, _) in &winner.mismatches {
+                    processed_data.insert(file.cache_key.clone());
+                }
+                if let Some((file, _, _)) = &winner.cue {
+                    processed_cues.insert(file.cache_key.clone());
+                }
+                if let Some((file, _)) = &winner.cue_mismatch {
+                    processed_cues.insert(file.cache_key.clone());
                 }
             }
         }
-
-        Ok(None)
+        Ok(())
     }
 
-    fn find_content_candidate(
+    fn evaluate_content_candidate(
         &mut self,
-        work: &[RuntimeFile],
-        library: &LibraryState,
-    ) -> Result<Option<PromotionCandidate>> {
-        let non_cue: Vec<_> = work.iter().filter(|file| !file.is_cue()).cloned().collect();
-        let cues: Vec<_> = work.iter().filter(|file| file.is_cue()).cloned().collect();
-
-        let mut game_indices = self.game_indices();
-        game_indices.sort_by_key(|(catalog_index, game_index)| {
-            let catalog = &self.catalogs[*catalog_index];
-            let game = &catalog.games[*game_index];
-            library.complete.contains(&GameKey {
-                system: catalog.name.clone(),
-                game: game.name.clone(),
-            })
+        game_id: GameId,
+        seed: &RuntimeFile,
+        work: &mut WorkInventory,
+        complete_games: &BTreeSet<GameId>,
+        processed_data: &BTreeSet<String>,
+        processed_cues: &BTreeSet<String>,
+    ) -> Result<CandidateEvaluation> {
+        let game = self.catalogs[game_id.catalog].games[game_id.game].clone();
+        let mut available_by_key = BTreeMap::new();
+        for rom in game.non_cue_roms() {
+            for file in work.files_for_content(&ContentId::from_rom(rom), true) {
+                if !processed_data.contains(&file.cache_key) {
+                    available_by_key.insert(file.cache_key.clone(), file);
+                }
+            }
+            if let Some(file) = work.get_by_name(OsStr::new(&rom.name)) {
+                if !file.is_cue() && !processed_data.contains(&file.cache_key) {
+                    available_by_key.insert(file.cache_key.clone(), file.clone());
+                }
+            }
+        }
+        let mut available: Vec<_> = available_by_key.into_values().collect();
+        available.sort_by(|left, right| {
+            ordering::os(&left.name, &right.name)
+                .then_with(|| ordering::path(&left.relative_path, &right.relative_path))
         });
-        for (catalog_index, game_index) in game_indices {
-            let catalog = &self.catalogs[catalog_index];
-            let game = &catalog.games[game_index];
-            let expected: Vec<_> = game.non_cue_roms().collect();
-            let Some(selected) = select_sources(&non_cue, &expected) else {
+        let selected_work = assign_partial_work_sources(&game, &available, Some(seed));
+        let mut non_cue: Vec<_> = selected_work
+            .iter()
+            .cloned()
+            .map(|(file, target)| (RomSource::Work(file), target))
+            .collect();
+        let mut assigned_targets: BTreeSet<_> = selected_work
+            .iter()
+            .map(|(_, target)| target.name.clone())
+            .collect();
+        let mut expected: Vec<_> = game.non_cue_roms().cloned().collect();
+        expected.sort_by(|left, right| ordering::text(&left.name, &right.name));
+        for target in &expected {
+            if assigned_targets.contains(&target.name) {
                 continue;
-            };
-            let source_hashes: Vec<_> = selected
-                .iter()
-                .map(|file| (file.assignment_id(), file.sha1.clone()))
-                .collect();
-            let Some(assignment) = deterministic_assignment(&source_hashes, &expected) else {
-                continue;
-            };
-            let non_cue_assignment = selected
-                .into_iter()
-                .map(|file| {
-                    let target_name = &assignment[&file.assignment_id()];
-                    let target = expected
-                        .iter()
-                        .find(|rom| rom.name == *target_name)
-                        .expect("assignment target came from expected ROMs");
-                    (file, (*target).clone())
-                })
-                .collect();
+            }
+            if let Some(source) = self.library_source_for(target, complete_games) {
+                non_cue.push((RomSource::Library(source), target.clone()));
+                assigned_targets.insert(target.name.clone());
+            }
+        }
+        non_cue.sort_by(|left, right| ordering::text(&left.1.name, &right.1.name));
 
-            let cue = if let Some(expected_cue) = game.cue() {
-                let mut correct = None;
-                for cue_file in &cues {
-                    if cue_file.name == OsStr::new(&expected_cue.name)
-                        && cue_file.size == expected_cue.size
-                        && cue_file.sha1 == expected_cue.sha1
-                    {
-                        let bytes = self.filesystem.read(&cue_file.absolute_path)?;
-                        if CueDocument::parse(&bytes).is_ok() {
-                            correct = Some((cue_file.clone(), expected_cue.clone(), bytes));
-                            break;
+        let selected_keys: BTreeSet<_> = selected_work
+            .iter()
+            .map(|(file, _)| file.cache_key.as_str())
+            .collect();
+        let mismatches = exact_mismatches(&game, &available, &assigned_targets, &selected_keys);
+        let (cue, cue_mismatch) = self.select_content_cue(&game, &non_cue, work, processed_cues)?;
+        let score = non_cue.len() + usize::from(cue.is_some());
+        let complete = non_cue.len() == expected.len() && (game.cue().is_none() || cue.is_some());
+        Ok(CandidateEvaluation {
+            game: game_id,
+            non_cue,
+            cue,
+            cue_mismatch,
+            mismatches,
+            score,
+            complete,
+        })
+    }
+
+    fn library_source_for(
+        &self,
+        target: &RomSpec,
+        complete_games: &BTreeSet<GameId>,
+    ) -> Option<PathBuf> {
+        self.dat_index
+            .roms_by_content
+            .get(&ContentId::from_rom(target))?
+            .iter()
+            .find_map(|location| {
+                if !complete_games.contains(&location.game) {
+                    return None;
+                }
+                let catalog = &self.catalogs[location.game.catalog];
+                let source_rom = &catalog.games[location.game.game].roms[location.rom];
+                (!source_rom.is_cue()).then(|| {
+                    self.config
+                        .library_path
+                        .join(&catalog.name)
+                        .join(&source_rom.name)
+                })
+            })
+    }
+
+    fn select_content_cue(
+        &mut self,
+        game: &GameSpec,
+        non_cue: &[(RomSource, RomSpec)],
+        work: &mut WorkInventory,
+        processed_cues: &BTreeSet<String>,
+    ) -> Result<(Option<SelectedCue>, Option<CueMismatch>)> {
+        let Some(expected) = game.cue().cloned() else {
+            return Ok((None, None));
+        };
+        let exact_key = work
+            .get_by_name(OsStr::new(&expected.name))
+            .filter(|file| file.is_cue() && !processed_cues.contains(&file.cache_key))
+            .map(|file| file.cache_key.clone());
+        if let Some(key) = &exact_key {
+            let (file, bytes, _) = work.load_cue(self.filesystem, key)?;
+            if file.size == expected.size && file.sha1 == expected.sha1 {
+                return Ok((Some((file, expected, bytes)), None));
+            }
+        }
+
+        let mut cue_keys = work.cue_keys_for_file_count(game.non_cue_roms().count());
+        if let Some(exact_key) = &exact_key {
+            if let Some(position) = cue_keys.iter().position(|key| key == exact_key) {
+                let exact = cue_keys.remove(position);
+                cue_keys.insert(0, exact);
+            }
+        }
+        for key in cue_keys {
+            if processed_cues.contains(&key) || !work.files.contains_key(&key) {
+                continue;
+            }
+            let (file, _, document) = work.load_cue(self.filesystem, &key)?;
+            let Some(document) = document else {
+                continue;
+            };
+            if let Some(bytes) = rewrite_selected_cue(&document, non_cue, &expected)? {
+                return Ok((Some((file, expected, bytes)), None));
+            }
+        }
+
+        let mismatch = exact_key
+            .and_then(|key| work.files.get(&key).cloned())
+            .map(|file| (file, expected));
+        Ok((None, mismatch))
+    }
+
+    fn evaluation_detail(&self, evaluation: &CandidateEvaluation) -> LeftoverDetail {
+        let catalog = &self.catalogs[evaluation.game.catalog];
+        let game = &catalog.games[evaluation.game.game];
+        let mut roms = game.roms.clone();
+        roms.sort_by(|left, right| ordering::text(&left.name, &right.name));
+        let matches = roms
+            .into_iter()
+            .map(|rom| {
+                if rom.is_cue() {
+                    if let Some((file, target, _)) = &evaluation.cue {
+                        if target.name == rom.name {
+                            return LeftoverMatch {
+                                expected_rom: rom.name,
+                                work_path: Some(work_relative_path(file)),
+                                status: LeftoverStatus::Ok,
+                            };
                         }
                     }
+                    if let Some((file, target)) = &evaluation.cue_mismatch {
+                        if target.name == rom.name {
+                            return LeftoverMatch {
+                                expected_rom: rom.name,
+                                work_path: Some(work_relative_path(file)),
+                                status: LeftoverStatus::Mismatch,
+                            };
+                        }
+                    }
+                } else if let Some((source, _)) = evaluation
+                    .non_cue
+                    .iter()
+                    .find(|(_, target)| target.name == rom.name)
+                {
+                    let (work_path, status) = match source {
+                        RomSource::Work(file) => {
+                            (Some(work_relative_path(file)), LeftoverStatus::Ok)
+                        }
+                        RomSource::Library(_) => (None, LeftoverStatus::Library),
+                    };
+                    return LeftoverMatch {
+                        expected_rom: rom.name,
+                        work_path,
+                        status,
+                    };
+                } else if let Some((file, _)) = evaluation
+                    .mismatches
+                    .iter()
+                    .find(|(_, target)| target.name == rom.name)
+                {
+                    return LeftoverMatch {
+                        expected_rom: rom.name,
+                        work_path: Some(work_relative_path(file)),
+                        status: LeftoverStatus::Mismatch,
+                    };
                 }
-                let Some(correct) = correct else {
-                    continue;
-                };
-                Some(correct)
-            } else {
-                None
-            };
-
-            return Ok(Some(PromotionCandidate {
-                key: GameKey {
-                    system: catalog.name.clone(),
-                    game: game.name.clone(),
-                },
-                system: catalog.name.clone(),
-                non_cue: non_cue_assignment,
-                cue,
-            }));
+                LeftoverMatch {
+                    expected_rom: rom.name,
+                    work_path: None,
+                    status: LeftoverStatus::Missing,
+                }
+            })
+            .collect();
+        LeftoverDetail {
+            system: catalog.name.clone(),
+            game: game.name.clone(),
+            matches,
         }
-        Ok(None)
+    }
+
+    fn emit_incomplete(&mut self, detail: LeftoverDetail) {
+        self.summary.leftover_details.push(detail.clone());
+        self.report(ProgressEvent::Incomplete { detail });
     }
 
     fn apply_candidate(
         &mut self,
         candidate: PromotionCandidate,
-        library: &LibraryState,
+        work: &mut WorkInventory,
+        complete_games: &mut BTreeSet<GameId>,
     ) -> Result<()> {
-        if library.complete.contains(&candidate.key) {
-            let mut paths = Vec::new();
-            for (file, _) in &candidate.non_cue {
-                paths.push((file.absolute_path.clone(), file.cache_key.clone()));
-            }
-            if let Some((cue, _, _)) = &candidate.cue {
-                paths.push((cue.absolute_path.clone(), cue.cache_key.clone()));
-            }
-            paths.sort_by(|left, right| ordering::path(&left.0, &right.0));
-            paths.dedup_by(|left, right| left.0 == right.0);
-            for (path, cache_key) in paths {
-                self.report(ProgressEvent::Removing {
-                    kind: ProgressRemovalKind::ExistingGameDuplicate,
-                    path: self.progress_path(&path),
-                });
-                self.filesystem.remove_file(&path)?;
-                self.cache.remove(WORK_AREA, &cache_key)?;
-                self.cache.checkpoint()?;
-                self.summary.existing_duplicates_removed += 1;
-            }
-            return Ok(());
-        }
-
+        let game_name = self.catalogs[candidate.game.catalog].games[candidate.game.game]
+            .name
+            .clone();
+        self.report(ProgressEvent::PromotingGame {
+            system: candidate.system.clone(),
+            game: game_name,
+        });
         let destination_directory = self.config.library_path.join(&candidate.system);
         self.filesystem
             .create_directory_all(&destination_directory)?;
         let mut non_cue: Vec<_> = candidate.non_cue.iter().collect();
-        non_cue.sort_by(|left, right| {
-            ordering::text(&left.1.name, &right.1.name)
-                .then_with(|| ordering::os(&left.0.name, &right.0.name))
-        });
+        non_cue.sort_by(|left, right| ordering::text(&left.1.name, &right.1.name));
         let mut target_paths = Vec::new();
         for (_, target) in &non_cue {
             target_paths.push(destination_directory.join(&target.name));
@@ -1037,28 +1576,43 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
             }
         }
 
-        self.report(ProgressEvent::PromotingGame {
-            system: candidate.key.system.clone(),
-            game: candidate.key.game.clone(),
-        });
         for (source, target) in non_cue {
             let destination = destination_directory.join(&target.name);
-            self.report(ProgressEvent::Moving {
-                kind: ProgressMoveKind::Promotion,
-                source: self.progress_path(&source.absolute_path),
-                destination: self.progress_path(&destination),
-            });
-            self.filesystem
-                .rename(&source.absolute_path, &destination)?;
-            self.cache.remove(WORK_AREA, &source.cache_key)?;
-            self.cache_known_hash(
-                LIBRARY_AREA,
-                &self.config.library_path,
-                &destination,
-                &source.sha1,
-            )?;
-            self.cache.checkpoint()?;
-            self.summary.rom_moves += 1;
+            match source {
+                RomSource::Work(source) => {
+                    self.report(ProgressEvent::Moving {
+                        kind: ProgressMoveKind::Promotion,
+                        source: self.progress_path(&source.absolute_path),
+                        destination: self.progress_path(&destination),
+                    });
+                    self.filesystem
+                        .rename(&source.absolute_path, &destination)?;
+                    self.cache_remove(WORK_AREA, &source.cache_key)?;
+                    self.cache_moved_file(
+                        LIBRARY_AREA,
+                        &self.config.library_path,
+                        &destination,
+                        source,
+                    )?;
+                    work.remove(&source.cache_key)
+                        .expect("candidate source exists in work inventory");
+                    self.summary.rom_moves += 1;
+                }
+                RomSource::Library(source) => {
+                    self.report(ProgressEvent::CopyingLibraryRom {
+                        source: self.progress_path(source),
+                        destination: self.progress_path(&destination),
+                    });
+                    self.filesystem.copy(source, &destination)?;
+                    self.cache_known_file(
+                        LIBRARY_AREA,
+                        &self.config.library_path,
+                        &destination,
+                        &target.sha1,
+                    )?;
+                    self.summary.library_copies += 1;
+                }
+            }
         }
 
         if let Some((source, target, bytes)) = &candidate.cue {
@@ -1068,185 +1622,24 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
                 destination: self.progress_path(&destination),
             });
             self.filesystem.write_atomic(&destination, bytes)?;
-            self.cache_known_hash(
+            self.cache_known_file(
                 LIBRARY_AREA,
                 &self.config.library_path,
                 &destination,
                 &target.sha1,
             )?;
-            self.cache.checkpoint()?;
             self.report(ProgressEvent::Removing {
                 kind: ProgressRemovalKind::RewrittenCueSource,
                 path: self.progress_path(&source.absolute_path),
             });
             self.filesystem.remove_file(&source.absolute_path)?;
-            self.cache.remove(WORK_AREA, &source.cache_key)?;
-            self.cache.checkpoint()?;
+            self.cache_remove(WORK_AREA, &source.cache_key)?;
+            work.remove(&source.cache_key)
+                .expect("candidate CUE exists in work inventory");
         }
+        complete_games.insert(candidate.game);
         self.summary.promotions += 1;
         Ok(())
-    }
-
-    fn try_recovery(
-        &mut self,
-        work: &[RuntimeFile],
-        library: &LibraryState,
-        attempted: &mut BTreeSet<GameKey>,
-    ) -> Result<bool> {
-        let non_cue: Vec<_> = work.iter().filter(|file| !file.is_cue()).cloned().collect();
-        for leftover in &non_cue {
-            let mut candidates = BTreeSet::new();
-            for catalog in self.catalogs {
-                for game in &catalog.games {
-                    if game
-                        .non_cue_roms()
-                        .any(|rom| rom.sha1 == leftover.sha1 && rom.size == leftover.size)
-                    {
-                        candidates.insert(GameKey {
-                            system: catalog.name.clone(),
-                            game: game.name.clone(),
-                        });
-                    }
-                }
-            }
-            if candidates.len() != 1 {
-                continue;
-            }
-            let key = candidates.into_iter().next().expect("one candidate exists");
-            if attempted.contains(&key) || library.complete.contains(&key) {
-                continue;
-            }
-            attempted.insert(key.clone());
-            let game = self
-                .find_game(&key)
-                .expect("candidate key came from selected catalogs")
-                .1
-                .clone();
-            let missing = missing_non_cue_roms(&game, &non_cue);
-            if missing.is_empty() {
-                continue;
-            }
-
-            let mut sources = Vec::new();
-            let mut available = true;
-            for rom in &missing {
-                let source = library
-                    .members
-                    .iter()
-                    .filter(|member| member.sha1 == rom.sha1 && member.size == rom.size)
-                    .min_by(|left, right| {
-                        ordering::path(&left.relative_path, &right.relative_path)
-                    });
-                let Some(source) = source else {
-                    available = false;
-                    break;
-                };
-                sources.push((source.clone(), rom.clone()));
-            }
-            if !available {
-                continue;
-            }
-
-            for (source, rom) in sources {
-                let destination =
-                    self.collision_destination(OsStr::new(&rom.name), EntryKind::File)?;
-                self.report(ProgressEvent::CopyingRecovery {
-                    source: self.progress_path(&source.absolute_path),
-                    destination: self.progress_path(&destination),
-                });
-                self.filesystem.copy(&source.absolute_path, &destination)?;
-                self.cache_known_hash(
-                    WORK_AREA,
-                    &self.config.work_path,
-                    &destination,
-                    &source.sha1,
-                )?;
-                self.cache.checkpoint()?;
-                self.summary.recovery_copies += 1;
-            }
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn remove_redundant_leftovers(&mut self, library: &LibraryState) -> Result<()> {
-        for file in self.scan_work()? {
-            if !file.is_cue() && library.hashes.contains(&file.sha1) {
-                self.report(ProgressEvent::Removing {
-                    kind: ProgressRemovalKind::RedundantLeftover,
-                    path: self.progress_path(&file.absolute_path),
-                });
-                self.filesystem.remove_file(&file.absolute_path)?;
-                self.cache.remove(WORK_AREA, &file.cache_key)?;
-                self.cache.checkpoint()?;
-                self.summary.redundant_leftovers_removed += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn read_library_state(&mut self) -> Result<LibraryState> {
-        let mut state = LibraryState::default();
-        for catalog_index in 0..self.catalogs.len() {
-            let catalog_name = self.catalogs[catalog_index].name.clone();
-            let games = self.catalogs[catalog_index].games.clone();
-            let files = self.scan_system(&catalog_name)?;
-            let files_by_name = files_by_utf8_name(&files);
-            for game in &games {
-                if game_is_complete(game, &files_by_name) {
-                    state.complete.insert(GameKey {
-                        system: catalog_name.clone(),
-                        game: game.name.clone(),
-                    });
-                    for rom in &game.roms {
-                        let file = files_by_name[&rom.name].clone();
-                        state.hashes.insert(file.sha1.clone());
-                        state.members.push(RuntimeFile {
-                            absolute_path: self
-                                .config
-                                .library_path
-                                .join(&catalog_name)
-                                .join(&rom.name),
-                            relative_path: file.relative_path.clone(),
-                            name: OsString::from(&rom.name),
-                            cache_key: relative_cache_key(&file.relative_path),
-                            size: file.size,
-                            modified_ns: file.modified_ns,
-                            sha1: file.sha1.clone(),
-                        });
-                    }
-                }
-            }
-        }
-        state
-            .members
-            .sort_by(|left, right| ordering::path(&left.relative_path, &right.relative_path));
-        Ok(state)
-    }
-
-    fn scan_system(&mut self, system: &str) -> Result<Vec<RuntimeFile>> {
-        let directory = self.config.library_path.join(system);
-        self.scan_regular_directory(LIBRARY_AREA, &self.config.library_path, &directory)
-    }
-
-    fn scan_work(&mut self) -> Result<Vec<RuntimeFile>> {
-        self.scan_regular_directory(WORK_AREA, &self.config.work_path, &self.config.work_path)
-    }
-
-    fn scan_regular_directory(
-        &mut self,
-        area: &str,
-        area_root: &Path,
-        directory: &Path,
-    ) -> Result<Vec<RuntimeFile>> {
-        let mut files = Vec::new();
-        for entry in self.filesystem.read_directory(directory)? {
-            if entry.kind == EntryKind::File {
-                files.push(self.hash_file(area, area_root, &entry.path)?);
-            }
-        }
-        files.sort_by(|left, right| ordering::os(&left.name, &right.name));
-        Ok(files)
     }
 
     fn hash_file(&mut self, area: &str, area_root: &Path, path: &Path) -> Result<RuntimeFile> {
@@ -1284,14 +1677,13 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
                 });
             }
             let sha1 = hash_reader(self.filesystem.open_reader(path)?)?;
-            self.cache.put(&CacheRecord {
+            self.cache_put(&CacheRecord {
                 area: area.to_owned(),
                 path: cache_key.clone(),
                 size: metadata.len,
                 modified_ns: metadata.modified_ns,
                 sha1: sha1.clone(),
             })?;
-            self.cache.checkpoint()?;
             if first_seen {
                 self.report(ProgressEvent::HashSaved {
                     path: self.progress_path(path),
@@ -1317,13 +1709,13 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
         })
     }
 
-    fn cache_known_hash(
+    fn cache_known_file(
         &mut self,
         area: &str,
         area_root: &Path,
         path: &Path,
         sha1: &str,
-    ) -> Result<()> {
+    ) -> Result<RuntimeFile> {
         let metadata = self.filesystem.metadata(path)?.ok_or_else(|| {
             RomeroError::Operational(format!("file disappeared: {}", path.display()))
         })?;
@@ -1333,14 +1725,65 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
                 path.display()
             )));
         }
+        self.cache_file_record(
+            area,
+            area_root,
+            path,
+            metadata.len,
+            metadata.modified_ns,
+            sha1,
+        )
+    }
+
+    fn cache_moved_file(
+        &mut self,
+        area: &str,
+        area_root: &Path,
+        path: &Path,
+        source: &RuntimeFile,
+    ) -> Result<RuntimeFile> {
+        self.cache_file_record(
+            area,
+            area_root,
+            path,
+            source.size,
+            source.modified_ns,
+            &source.sha1,
+        )
+    }
+
+    fn cache_file_record(
+        &mut self,
+        area: &str,
+        area_root: &Path,
+        path: &Path,
+        size: u64,
+        modified_ns: i64,
+        sha1: &str,
+    ) -> Result<RuntimeFile> {
         let relative = path.strip_prefix(area_root).map_err(|_| {
             RomeroError::Operational(format!("{} is outside {area}", path.display()))
         })?;
-        self.cache.put(&CacheRecord {
+        let cache_key = relative_cache_key(relative);
+        self.cache_put(&CacheRecord {
             area: area.to_owned(),
-            path: relative_cache_key(relative),
-            size: metadata.len,
-            modified_ns: metadata.modified_ns,
+            path: cache_key.clone(),
+            size,
+            modified_ns,
+            sha1: sha1.to_owned(),
+        })?;
+        Ok(RuntimeFile {
+            absolute_path: path.to_path_buf(),
+            relative_path: relative.to_path_buf(),
+            name: path
+                .file_name()
+                .ok_or_else(|| {
+                    RomeroError::Operational(format!("file has no name: {}", path.display()))
+                })?
+                .to_os_string(),
+            cache_key,
+            size,
+            modified_ns,
             sha1: sha1.to_owned(),
         })
     }
@@ -1353,9 +1796,8 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
             destination: self.progress_path(&destination),
         });
         self.filesystem.rename(&file.absolute_path, &destination)?;
-        self.cache.remove(LIBRARY_AREA, &file.cache_key)?;
-        self.cache_known_hash(WORK_AREA, &self.config.work_path, &destination, &file.sha1)?;
-        self.cache.checkpoint()?;
+        self.cache_remove(LIBRARY_AREA, &file.cache_key)?;
+        self.cache_moved_file(WORK_AREA, &self.config.work_path, &destination, file)?;
         self.summary.rom_moves += 1;
         Ok(())
     }
@@ -1380,33 +1822,14 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
         )))
     }
 
-    fn game_indices(&self) -> Vec<(usize, usize)> {
-        let mut indices = Vec::new();
-        for (catalog_index, catalog) in self.catalogs.iter().enumerate() {
-            for (game_index, game) in catalog.games.iter().enumerate() {
-                indices.push((catalog_index, game_index, game.name.as_str()));
-            }
-        }
-        indices.sort_by(|left, right| {
-            ordering::text(&self.catalogs[left.0].name, &self.catalogs[right.0].name)
-                .then_with(|| ordering::text(left.2, right.2))
-        });
-        indices
-            .into_iter()
-            .map(|(catalog, game, _)| (catalog, game))
-            .collect()
-    }
-
-    fn find_game(&self, key: &GameKey) -> Option<(&DatCatalog, &GameSpec)> {
-        self.catalogs.iter().find_map(|catalog| {
-            if catalog.name != key.system {
-                return None;
-            }
-            catalog
-                .games
-                .iter()
-                .find(|game| game.name == key.game)
-                .map(|game| (catalog, game))
+    fn compare_games(&self, left: GameId, right: GameId) -> std::cmp::Ordering {
+        let left_catalog = &self.catalogs[left.catalog];
+        let right_catalog = &self.catalogs[right.catalog];
+        ordering::text(&left_catalog.name, &right_catalog.name).then_with(|| {
+            ordering::text(
+                &left_catalog.games[left.game].name,
+                &right_catalog.games[right.game].name,
+            )
         })
     }
 }
@@ -1426,51 +1849,6 @@ fn files_by_utf8_name(files: &[RuntimeFile]) -> BTreeMap<String, HashedFile> {
             ))
         })
         .collect()
-}
-
-fn select_sources(available: &[RuntimeFile], expected: &[&RomSpec]) -> Option<Vec<RuntimeFile>> {
-    let mut by_identity = BTreeMap::<(String, u64), Vec<RuntimeFile>>::new();
-    for file in available {
-        by_identity
-            .entry((file.sha1.clone(), file.size))
-            .or_default()
-            .push(file.clone());
-    }
-    for files in by_identity.values_mut() {
-        files.sort_by(|left, right| ordering::os(&left.name, &right.name));
-    }
-
-    let mut selected = Vec::new();
-    let mut used = BTreeMap::<(String, u64), usize>::new();
-    let mut expected_sorted = expected.to_vec();
-    expected_sorted.sort_by(|left, right| ordering::text(&left.name, &right.name));
-    for rom in expected_sorted {
-        let identity = (rom.sha1.clone(), rom.size);
-        let index = used.entry(identity.clone()).or_default();
-        let file = by_identity.get(&identity)?.get(*index)?.clone();
-        *index += 1;
-        selected.push(file);
-    }
-    Some(selected)
-}
-
-fn missing_non_cue_roms(game: &GameSpec, work: &[RuntimeFile]) -> Vec<RomSpec> {
-    let mut available = BTreeMap::<(String, u64), usize>::new();
-    for file in work {
-        *available.entry((file.sha1.clone(), file.size)).or_default() += 1;
-    }
-    let mut expected: Vec<_> = game.non_cue_roms().cloned().collect();
-    expected.sort_by(|left, right| ordering::text(&left.name, &right.name));
-    let mut missing = Vec::new();
-    for rom in expected {
-        let count = available.entry((rom.sha1.clone(), rom.size)).or_default();
-        if *count > 0 {
-            *count -= 1;
-        } else {
-            missing.push(rom);
-        }
-    }
-    missing
 }
 
 fn hash_reader(mut reader: Box<dyn Read>) -> Result<String> {
@@ -1524,9 +1902,25 @@ mod tests {
         }
     }
 
+    fn runtime_work_file(name: &str, contents: &[u8]) -> RuntimeFile {
+        RuntimeFile {
+            absolute_path: Path::new("/root/work").join(name),
+            relative_path: PathBuf::from(name),
+            name: OsString::from(name),
+            cache_key: relative_cache_key(Path::new(name)),
+            size: contents.len() as u64,
+            modified_ns: 1,
+            sha1: sha1_bytes(contents),
+        }
+    }
+
     fn catalog(games: Vec<GameSpec>) -> DatCatalog {
+        named_catalog("System", games)
+    }
+
+    fn named_catalog(name: &str, games: Vec<GameSpec>) -> DatCatalog {
         DatCatalog {
-            name: "System".into(),
+            name: name.into(),
             date: DatDate([2026, 1, 1, 0, 0, 0]),
             games,
             source: "memory.dat".into(),
@@ -1559,11 +1953,11 @@ mod tests {
             self.inner.put(record)
         }
 
-        fn remove(&mut self, area: &str, path: &str) -> Result<()> {
+        fn remove(&mut self, area: &str, path: &str) -> Result<bool> {
             self.inner.remove(area, path)
         }
 
-        fn retain(&mut self, seen: &BTreeSet<(String, String)>) -> Result<()> {
+        fn retain(&mut self, seen: &BTreeSet<(String, String)>) -> Result<bool> {
             self.inner.retain(seen)
         }
 
@@ -1573,6 +1967,81 @@ mod tests {
 
         fn commit(&mut self) -> Result<()> {
             self.inner.commit()
+        }
+    }
+
+    struct CountingCache {
+        inner: SqliteCache,
+        gets: std::cell::Cell<usize>,
+        checkpoints: usize,
+        commits: usize,
+        fail_checkpoint: bool,
+        fail_commit: bool,
+    }
+
+    impl CountingCache {
+        fn new() -> Self {
+            Self {
+                inner: SqliteCache::in_memory().unwrap(),
+                gets: std::cell::Cell::new(0),
+                checkpoints: 0,
+                commits: 0,
+                fail_checkpoint: false,
+                fail_commit: false,
+            }
+        }
+
+        fn failing_checkpoint() -> Self {
+            Self {
+                fail_checkpoint: true,
+                ..Self::new()
+            }
+        }
+
+        fn failing_commit() -> Self {
+            Self {
+                fail_commit: true,
+                ..Self::new()
+            }
+        }
+    }
+
+    impl CacheStore for CountingCache {
+        fn get(&self, area: &str, path: &str) -> Result<Option<CacheRecord>> {
+            self.gets.set(self.gets.get() + 1);
+            self.inner.get(area, path)
+        }
+
+        fn put(&mut self, record: &CacheRecord) -> Result<()> {
+            self.inner.put(record)
+        }
+
+        fn remove(&mut self, area: &str, path: &str) -> Result<bool> {
+            self.inner.remove(area, path)
+        }
+
+        fn retain(&mut self, seen: &BTreeSet<(String, String)>) -> Result<bool> {
+            self.inner.retain(seen)
+        }
+
+        fn checkpoint(&mut self) -> Result<()> {
+            if std::mem::take(&mut self.fail_checkpoint) {
+                return Err(RomeroError::Cache(
+                    "injected cache checkpoint failure".into(),
+                ));
+            }
+            self.inner.checkpoint()?;
+            self.checkpoints += 1;
+            Ok(())
+        }
+
+        fn commit(&mut self) -> Result<()> {
+            if std::mem::take(&mut self.fail_commit) {
+                return Err(RomeroError::Cache("injected cache commit failure".into()));
+            }
+            self.inner.commit()?;
+            self.commits += 1;
+            Ok(())
         }
     }
 
@@ -1601,6 +2070,289 @@ mod tests {
     }
 
     #[test]
+    fn batches_hash_and_promotion_cache_mutations_without_forced_checkpoints() {
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/first-download.bin", b"first".to_vec());
+        filesystem.add_file("/root/work/second-download.bin", b"second".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "First".into(),
+                roms: vec![rom("First.bin", b"first")],
+            },
+            GameSpec {
+                name: "Second".into(),
+                roms: vec![rom("Second.bin", b"second")],
+            },
+        ])];
+        let mut cache = CountingCache::new();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.promotions, 2);
+        assert_eq!(filesystem.read_directory_calls(), 3);
+        assert_eq!(filesystem.metadata_calls(), 5);
+        assert_eq!(cache.gets.get(), 2);
+        assert_eq!(
+            cache.checkpoints, 0,
+            "sub-minute cache mutations must remain in the active transaction"
+        );
+        assert!(
+            cache
+                .get(
+                    LIBRARY_AREA,
+                    &relative_cache_key(Path::new("System/First.bin"))
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cache
+                .get(
+                    LIBRARY_AREA,
+                    &relative_cache_key(Path::new("System/Second.bin"))
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cache
+                .get(
+                    WORK_AREA,
+                    &relative_cache_key(Path::new("first-download.bin"))
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(
+                    WORK_AREA,
+                    &relative_cache_key(Path::new("second-download.bin"))
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cache_checkpoint_scheduler_uses_first_dirty_time_and_resets_after_commit() {
+        let start = Instant::now();
+        let mut scheduler = CacheCheckpointScheduler::new(CACHE_CHECKPOINT_INTERVAL);
+
+        assert!(!scheduler.checkpoint_due(start + Duration::from_secs(120)));
+        scheduler.mark_dirty(start);
+        assert!(!scheduler.checkpoint_due(start + Duration::from_secs(59)));
+        assert!(scheduler.checkpoint_due(start + Duration::from_secs(60)));
+
+        scheduler.committed();
+        assert!(!scheduler.checkpoint_due(start + Duration::from_secs(180)));
+        scheduler.mark_dirty(start + Duration::from_secs(180));
+        assert!(!scheduler.checkpoint_due(start + Duration::from_secs(239)));
+        assert!(scheduler.checkpoint_due(start + Duration::from_secs(240)));
+    }
+
+    #[test]
+    fn no_op_inventory_cleanup_does_not_start_the_commit_timer() {
+        use std::cell::Cell;
+
+        let (filesystem, config) = fixture();
+        let mut cache = CountingCache::new();
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let mut now = || clock.get();
+        let mut progress = |event: &ProgressEvent| {
+            if matches!(event, ProgressEvent::WritingReports) {
+                clock.set(start + CACHE_CHECKPOINT_INTERVAL);
+            }
+        };
+
+        execute_with_progress_and_clock(
+            &filesystem,
+            &mut cache,
+            &config,
+            &[],
+            &mut progress,
+            &mut now,
+        )
+        .unwrap();
+
+        assert_eq!(cache.checkpoints, 0);
+    }
+
+    #[test]
+    fn periodic_checkpoint_batches_hashes_and_emits_progress_after_success() {
+        use std::cell::Cell;
+
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/first.bin", b"first".to_vec());
+        filesystem.add_file("/root/work/second.bin", b"second".to_vec());
+        let mut cache = CountingCache::new();
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let mut now = || clock.get();
+        let mut events = Vec::new();
+        let mut progress = |event: &ProgressEvent| {
+            events.push(event.clone());
+            if matches!(
+                event,
+                ProgressEvent::HashSaved { path } if path == Path::new("work/first.bin")
+            ) {
+                clock.set(start + CACHE_CHECKPOINT_INTERVAL);
+            }
+        };
+
+        execute_with_progress_and_clock(
+            &filesystem,
+            &mut cache,
+            &config,
+            &[],
+            &mut progress,
+            &mut now,
+        )
+        .unwrap();
+
+        assert_eq!(cache.checkpoints, 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        ProgressEvent::CacheCommitted {
+                            reason: CacheCommitReason::PeriodicCheckpoint
+                        }
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            ProgressEvent::CacheCommitted {
+                reason: CacheCommitReason::PeriodicCheckpoint,
+            }
+            .to_string(),
+            "Cache committed: periodic checkpoint"
+        );
+    }
+
+    #[test]
+    fn completed_run_commit_emits_progress_after_success() {
+        let mut cache = CountingCache::new();
+        let mut events = Vec::new();
+
+        commit_completed_run(&mut cache, &mut |event| events.push(event.clone())).unwrap();
+
+        assert_eq!(cache.commits, 1);
+        assert_eq!(
+            events,
+            vec![ProgressEvent::CacheCommitted {
+                reason: CacheCommitReason::RunComplete,
+            }]
+        );
+        assert_eq!(events[0].to_string(), "Cache committed: run complete");
+    }
+
+    #[test]
+    fn periodic_checkpoint_survives_interruption_and_the_next_run_reuses_it() {
+        use std::cell::Cell;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/first.bin", b"first".to_vec());
+        filesystem.add_file("/root/work/second.bin", b"second".to_vec());
+        let mut cache = CountingCache::new();
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let mut now = || clock.get();
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            let mut progress = |event: &ProgressEvent| match event {
+                ProgressEvent::HashSaved { path } if path == Path::new("work/first.bin") => {
+                    clock.set(start + CACHE_CHECKPOINT_INTERVAL);
+                }
+                ProgressEvent::CacheCommitted {
+                    reason: CacheCommitReason::PeriodicCheckpoint,
+                } => panic!("simulated interruption after checkpoint"),
+                _ => {}
+            };
+            let _ = execute_with_progress_and_clock(
+                &filesystem,
+                &mut cache,
+                &config,
+                &[],
+                &mut progress,
+                &mut now,
+            );
+        }));
+
+        assert!(interrupted.is_err());
+        assert_eq!(cache.checkpoints, 1);
+        assert!(
+            cache
+                .get(WORK_AREA, &relative_cache_key(Path::new("first.bin")))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cache
+                .get(WORK_AREA, &relative_cache_key(Path::new("second.bin")))
+                .unwrap()
+                .is_none()
+        );
+
+        let resumed = execute(&filesystem, &mut cache, &config, &[]).unwrap();
+        assert_eq!(resumed.cache_hits, 1);
+        assert_eq!(resumed.cache_misses, 1);
+    }
+
+    #[test]
+    fn failed_periodic_and_final_commits_emit_no_success_progress() {
+        use std::cell::Cell;
+
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/first.bin", b"first".to_vec());
+        filesystem.add_file("/root/work/second.bin", b"second".to_vec());
+        let mut cache = CountingCache::failing_checkpoint();
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let mut now = || clock.get();
+        let mut events = Vec::new();
+        let mut progress = |event: &ProgressEvent| {
+            events.push(event.clone());
+            if matches!(
+                event,
+                ProgressEvent::HashSaved { path } if path == Path::new("work/first.bin")
+            ) {
+                clock.set(start + CACHE_CHECKPOINT_INTERVAL);
+            }
+        };
+
+        assert!(
+            execute_with_progress_and_clock(
+                &filesystem,
+                &mut cache,
+                &config,
+                &[],
+                &mut progress,
+                &mut now,
+            )
+            .is_err()
+        );
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::CacheCommitted {
+                    reason: CacheCommitReason::PeriodicCheckpoint
+                }
+            )
+        }));
+
+        let mut cache = CountingCache::failing_commit();
+        let mut events = Vec::new();
+        assert!(commit_completed_run(&mut cache, &mut |event| events.push(event.clone())).is_err());
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn emits_deterministic_progress_for_hashing_promotion_and_reports() {
         let (filesystem, config) = fixture();
         filesystem.add_file("/root/work/download.bin", b"payload".to_vec());
@@ -1619,6 +2371,19 @@ mod tests {
 
         assert!(events.contains(&ProgressEvent::AuditingLibrary));
         assert!(events.contains(&ProgressEvent::ProcessingWork));
+        let content_matching = events
+            .iter()
+            .position(|event| *event == ProgressEvent::MatchingContent)
+            .expect("content matching event");
+        assert_eq!(
+            ProgressEvent::MatchingContent.to_string(),
+            "Content matching"
+        );
+        let promotion = events
+            .iter()
+            .position(|event| matches!(event, ProgressEvent::PromotingGame { .. }))
+            .expect("promotion event");
+        assert!(content_matching < promotion);
         assert!(events.contains(&ProgressEvent::IgnoringWorkEntry {
             path: PathBuf::from("work/notes"),
             kind: "directory".into(),
@@ -1647,7 +2412,7 @@ mod tests {
         assert!(events.contains(&ProgressEvent::HashSaved {
             path: PathBuf::from("work/download.bin"),
         }));
-        assert!(events.contains(&ProgressEvent::CacheHit {
+        assert!(!events.contains(&ProgressEvent::CacheHit {
             path: PathBuf::from("library/System/Expected.bin"),
         }));
         assert!(events.contains(&ProgressEvent::PromotingGame {
@@ -1692,7 +2457,280 @@ mod tests {
     }
 
     #[test]
-    fn first_full_cue_match_is_applied_without_comparing_other_games() {
+    fn indexes_each_work_cue_once_before_content_matching() {
+        let (filesystem, config) = fixture();
+        let source_cue = b"FILE \"download.bin\" BINARY\n";
+        let expected_cue = b"FILE \"Game.bin\" BINARY\n";
+        filesystem.add_file(
+            "/root/work/a-unmatched.cue",
+            b"FILE \"absent.bin\" BINARY\n".to_vec(),
+        );
+        filesystem.add_file("/root/work/download.bin", b"disc".to_vec());
+        filesystem.add_file("/root/work/z-matching.cue", source_cue.to_vec());
+        let catalogs = [catalog(vec![GameSpec {
+            name: "Game".into(),
+            roms: vec![rom("Game.cue", expected_cue), rom("Game.bin", b"disc")],
+        }])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.promotions, 1);
+        assert_eq!(
+            filesystem.read_calls(),
+            2,
+            "each CUE must be read exactly once while building the index"
+        );
+        assert!(filesystem.contains("/root/work/a-unmatched.cue"));
+    }
+
+    #[test]
+    fn cue_index_groups_valid_sheets_by_file_count_in_filename_order() {
+        let (filesystem, _) = fixture();
+        let inputs: [(&str, &[u8]); 4] = [
+            ("Zulu.cue", b"FILE \"z.bin\" BINARY\n"),
+            ("alpha.cue", b"FILE \"a.bin\" BINARY\n"),
+            (
+                "two.cue",
+                b"FILE \"one.bin\" BINARY\nFILE \"two.bin\" BINARY\n",
+            ),
+            ("invalid.cue", b"TRACK 01 AUDIO\n"),
+        ];
+        for (name, contents) in inputs {
+            filesystem.add_file(Path::new("/root/work").join(name), contents.to_vec());
+        }
+        let mut work = WorkInventory::new(
+            inputs
+                .into_iter()
+                .map(|(name, contents)| runtime_work_file(name, contents))
+                .collect(),
+        );
+
+        work.index_cues(&filesystem).unwrap();
+
+        let names_for = |count| {
+            work.cue_keys_for_file_count(count)
+                .into_iter()
+                .map(|key| work.files[&key].name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names_for(1), ["alpha.cue", "Zulu.cue"]);
+        assert_eq!(names_for(2), ["two.cue"]);
+        assert!(names_for(0).is_empty());
+        assert_eq!(work.cues.len(), 4, "invalid CUE bytes are cached too");
+        assert_eq!(filesystem.read_calls(), 4);
+    }
+
+    #[test]
+    fn exact_hash_matching_cue_bypasses_file_count_filter() {
+        let (filesystem, config) = fixture();
+        let exact_cue = b"FILE \"Game One.bin\" BINARY\n";
+        filesystem.add_file("/root/work/Game.cue", exact_cue.to_vec());
+        filesystem.add_file("/root/work/one.bin", b"one".to_vec());
+        filesystem.add_file("/root/work/two.bin", b"two".to_vec());
+        let catalogs = [catalog(vec![GameSpec {
+            name: "Game".into(),
+            roms: vec![
+                rom("Game.cue", exact_cue),
+                rom("Game One.bin", b"one"),
+                rom("Game Two.bin", b"two"),
+            ],
+        }])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.promotions, 1);
+        assert_eq!(
+            filesystem.contents("/root/library/System/Game.cue"),
+            Some(exact_cue.to_vec())
+        );
+    }
+
+    #[test]
+    fn exact_name_wrong_hash_cue_is_rewritten_before_other_same_count_cues() {
+        let (filesystem, config) = fixture();
+        let source_cue = b"FILE \"download.bin\" BINARY\n";
+        let expected_cue = b"FILE \"Game.bin\" BINARY\n";
+        filesystem.add_file("/root/work/download.bin", b"disc".to_vec());
+        filesystem.add_file("/root/work/a-template.cue", source_cue.to_vec());
+        filesystem.add_file("/root/work/Game.cue", source_cue.to_vec());
+        let catalogs = [catalog(vec![GameSpec {
+            name: "Game".into(),
+            roms: vec![rom("Game.cue", expected_cue), rom("Game.bin", b"disc")],
+        }])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.promotions, 1);
+        assert!(!filesystem.contains("/root/work/Game.cue"));
+        assert!(filesystem.contains("/root/work/a-template.cue"));
+        assert_eq!(
+            filesystem.contents("/root/library/System/Game.cue"),
+            Some(expected_cue.to_vec())
+        );
+    }
+
+    #[test]
+    fn alternate_cue_search_uses_first_same_count_sheet_only() {
+        let (filesystem, config) = fixture();
+        let wrong_count = b"FILE \"download-one.bin\" BINARY\n";
+        let source_cue = b"FILE \"download-one.bin\" BINARY\nFILE \"download-two.bin\" BINARY\n";
+        let expected_cue = b"FILE \"Game One.bin\" BINARY\nFILE \"Game Two.bin\" BINARY\n";
+        filesystem.add_file("/root/work/download-one.bin", b"one".to_vec());
+        filesystem.add_file("/root/work/download-two.bin", b"two".to_vec());
+        filesystem.add_file("/root/work/a-wrong-count.cue", wrong_count.to_vec());
+        filesystem.add_file("/root/work/b-first-match.cue", source_cue.to_vec());
+        filesystem.add_file("/root/work/z-later-match.cue", source_cue.to_vec());
+        let catalogs = [catalog(vec![GameSpec {
+            name: "Game".into(),
+            roms: vec![
+                rom("Game.cue", expected_cue),
+                rom("Game One.bin", b"one"),
+                rom("Game Two.bin", b"two"),
+            ],
+        }])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.promotions, 1);
+        assert!(filesystem.contains("/root/work/a-wrong-count.cue"));
+        assert!(!filesystem.contains("/root/work/b-first-match.cue"));
+        assert!(filesystem.contains("/root/work/z-later-match.cue"));
+        assert_eq!(
+            filesystem.contents("/root/library/System/Game.cue"),
+            Some(expected_cue.to_vec())
+        );
+    }
+
+    #[test]
+    fn content_queue_emits_an_incomplete_result_before_a_later_promotion() {
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/a-partial.bin", b"partial".to_vec());
+        filesystem.add_file(
+            "/root/work/a-partial.cue",
+            b"FILE \"a-partial.bin\" BINARY\n".to_vec(),
+        );
+        filesystem.add_file("/root/work/z-complete.bin", b"complete".to_vec());
+        filesystem.add_file(
+            "/root/work/z-complete.cue",
+            b"FILE \"z-complete.bin\" BINARY\n".to_vec(),
+        );
+        let partial_cue = b"FILE \"Partial One.bin\" BINARY\nFILE \"Partial Two.bin\" BINARY\n";
+        let complete_cue = b"FILE \"Complete.bin\" BINARY\n";
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Partial".into(),
+                roms: vec![
+                    rom("Partial.cue", partial_cue),
+                    rom("Partial One.bin", b"partial"),
+                    rom("Partial Two.bin", b"missing"),
+                ],
+            },
+            GameSpec {
+                name: "Complete".into(),
+                roms: vec![
+                    rom("Complete.cue", complete_cue),
+                    rom("Complete.bin", b"complete"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+        let mut events = Vec::new();
+
+        let summary =
+            execute_with_progress(&filesystem, &mut cache, &config, &catalogs, &mut |event| {
+                events.push(event.clone())
+            })
+            .unwrap();
+
+        let incomplete_position = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ProgressEvent::Incomplete { detail } if detail.game == "Partial"
+                )
+            })
+            .expect("partial content candidate emits immediately");
+        let promotion_position = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ProgressEvent::PromotingGame { game, .. } if game == "Complete"
+                )
+            })
+            .expect("later complete content candidate promotes");
+        assert!(incomplete_position < promotion_position);
+        assert_eq!(summary.leftover_details.len(), 1);
+        assert_eq!(summary.leftover_details[0].game, "Partial");
+        assert!(filesystem.contains("/root/work/a-partial.bin"));
+        assert!(filesystem.contains("/root/work/a-partial.cue"));
+        assert_eq!(summary.promotions, 1);
+    }
+
+    #[test]
+    fn cue_only_work_does_not_seed_content_matching() {
+        let (filesystem, config) = fixture();
+        let cue = b"FILE \"missing-download.bin\" BINARY\n";
+        filesystem.add_file("/root/work/Game.cue", cue.to_vec());
+        let catalogs = [catalog(vec![GameSpec {
+            name: "Game".into(),
+            roms: vec![rom("Game.cue", cue), rom("Game.bin", b"missing")],
+        }])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert!(summary.leftover_details.is_empty());
+        assert_eq!(summary.promotions, 0);
+        assert_eq!(summary.missing_games, 1);
+        assert!(filesystem.contains("/root/work/Game.cue"));
+    }
+
+    #[test]
+    fn cue_references_do_not_reserve_data_from_content_matching() {
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/shared.bin", b"shared".to_vec());
+        for cue in ["a.cue", "b.cue"] {
+            filesystem.add_file(
+                Path::new("/root/work").join(cue),
+                b"FILE \"shared.bin\" BINARY\n".to_vec(),
+            );
+        }
+        let expected_cue = b"FILE \"Game Shared.bin\" BINARY\nFILE \"Game Missing.bin\" BINARY\n";
+        let catalogs = [catalog(vec![GameSpec {
+            name: "Game".into(),
+            roms: vec![
+                rom("Game.cue", expected_cue),
+                rom("Game Shared.bin", b"shared"),
+                rom("Game Missing.bin", b"missing"),
+            ],
+        }])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.leftover_details.len(), 1);
+        assert_eq!(summary.leftover_details[0].game, "Game");
+        assert_eq!(
+            summary.leftover_details[0]
+                .matches
+                .iter()
+                .find(|rom| rom.expected_rom == "Game Shared.bin")
+                .map(|rom| &rom.status),
+            Some(&LeftoverStatus::Ok)
+        );
+        assert!(filesystem.contains("/root/work/shared.bin"));
+        assert!(filesystem.contains("/root/work/a.cue"));
+        assert!(filesystem.contains("/root/work/b.cue"));
+    }
+
+    #[test]
+    fn first_complete_content_candidate_wins_the_game_order_tie() {
         let (filesystem, config) = fixture();
         let source_cue = b"FILE \"download.bin\" BINARY\n";
         let first_cue = b"FILE \"First.bin\" BINARY\n";
@@ -1811,7 +2849,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_copies_shared_content_then_promotes_the_unique_game() {
+    fn content_matching_copies_shared_library_content_then_promotes() {
         let (filesystem, config) = fixture();
         filesystem.add_directory("/root/library/System");
         filesystem.add_file("/root/library/System/Existing.bin", b"shared".to_vec());
@@ -1833,7 +2871,7 @@ mod tests {
 
         let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
 
-        assert_eq!(summary.recovery_copies, 1);
+        assert_eq!(summary.library_copies, 1);
         assert_eq!(summary.promotions, 1);
         assert_eq!(
             filesystem.contents("/root/library/System/Target.bin"),
@@ -1850,7 +2888,293 @@ mod tests {
     }
 
     #[test]
-    fn deletes_redundant_non_cue_leftover_but_not_a_cue() {
+    fn content_matching_prefers_work_content_over_an_equal_library_source() {
+        let (filesystem, config) = fixture();
+        filesystem.add_directory("/root/library/System");
+        filesystem.add_file("/root/library/System/Source.bin", b"shared".to_vec());
+        filesystem.add_file("/root/work/a-unique.bin", b"unique".to_vec());
+        filesystem.add_file("/root/work/z-shared.bin", b"shared".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Source".into(),
+                roms: vec![rom("Source.bin", b"shared")],
+            },
+            GameSpec {
+                name: "Target".into(),
+                roms: vec![
+                    rom("Target Unique.bin", b"unique"),
+                    rom("Target Shared.bin", b"shared"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.promotions, 1);
+        assert_eq!(summary.library_copies, 0);
+        assert!(!filesystem.contains("/root/work/z-shared.bin"));
+        assert_eq!(
+            filesystem.contents("/root/library/System/Target Shared.bin"),
+            Some(b"shared".to_vec())
+        );
+    }
+
+    #[test]
+    fn alternate_cue_can_reference_an_exact_dat_name_supplied_from_library() {
+        let (filesystem, config) = fixture();
+        filesystem.add_directory("/root/library/System");
+        filesystem.add_file("/root/library/System/Source Data.bin", b"data".to_vec());
+        filesystem.add_file("/root/work/seed.bin", b"seed".to_vec());
+        let source_cue = b"FILE \"seed.bin\" BINARY\nFILE \"Target Data.bin\" BINARY\n";
+        let expected_cue = b"FILE \"Target Seed.bin\" BINARY\nFILE \"Target Data.bin\" BINARY\n";
+        filesystem.add_file("/root/work/template.cue", source_cue.to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Source".into(),
+                roms: vec![rom("Source Data.bin", b"data")],
+            },
+            GameSpec {
+                name: "Target".into(),
+                roms: vec![
+                    rom("Target.cue", expected_cue),
+                    rom("Target Seed.bin", b"seed"),
+                    rom("Target Data.bin", b"data"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.promotions, 1);
+        assert_eq!(summary.library_copies, 1);
+        assert_eq!(
+            filesystem.contents("/root/library/System/Target.cue"),
+            Some(expected_cue.to_vec())
+        );
+        assert!(!filesystem.contains("/root/work/template.cue"));
+    }
+
+    #[test]
+    fn library_copy_derives_a_source_from_another_system_and_dat_filename() {
+        let (filesystem, config) = fixture();
+        filesystem.add_directory("/root/library/Alpha System");
+        filesystem.add_file(
+            "/root/library/Alpha System/Source Name.bin",
+            b"shared".to_vec(),
+        );
+        filesystem.add_file("/root/work/download.bin", b"unique".to_vec());
+        let catalogs = [
+            named_catalog(
+                "Alpha System",
+                vec![GameSpec {
+                    name: "Source".into(),
+                    roms: vec![rom("Source Name.bin", b"shared")],
+                }],
+            ),
+            named_catalog(
+                "Beta System",
+                vec![GameSpec {
+                    name: "Target".into(),
+                    roms: vec![
+                        rom("Target Unique.bin", b"unique"),
+                        rom("Different Target Name.bin", b"shared"),
+                    ],
+                }],
+            ),
+        ];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.library_copies, 1);
+        assert_eq!(summary.promotions, 1);
+        assert_eq!(
+            filesystem.contents("/root/library/Beta System/Different Target Name.bin"),
+            Some(b"shared".to_vec())
+        );
+    }
+
+    #[test]
+    fn content_matching_rejects_library_sources_from_incomplete_games() {
+        let (filesystem, config) = fixture();
+        filesystem.add_directory("/root/library/Alpha System");
+        filesystem.add_file(
+            "/root/library/Alpha System/Source Name.bin",
+            b"wrong".to_vec(),
+        );
+        filesystem.add_file("/root/work/download.bin", b"unique".to_vec());
+        let catalogs = [
+            named_catalog(
+                "Alpha System",
+                vec![GameSpec {
+                    name: "Incomplete Source".into(),
+                    roms: vec![
+                        rom("Source Name.bin", b"shared"),
+                        rom("Missing Companion.bin", b"companion"),
+                    ],
+                }],
+            ),
+            named_catalog(
+                "Beta System",
+                vec![GameSpec {
+                    name: "Target".into(),
+                    roms: vec![
+                        rom("Target Unique.bin", b"unique"),
+                        rom("Target Shared.bin", b"shared"),
+                    ],
+                }],
+            ),
+        ];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.library_copies, 0);
+        assert_eq!(summary.promotions, 0);
+        assert!(filesystem.contains("/root/work/download.bin"));
+        assert!(!filesystem.contains("/root/library/Beta System/Target Shared.bin"));
+    }
+
+    #[test]
+    fn library_copy_chooses_the_first_complete_source_path_case_insensitively() {
+        let (filesystem, config) = fixture();
+        filesystem.add_directory("/root/library/alpha system");
+        filesystem.add_file(
+            "/root/library/alpha system/Alpha Shared.bin",
+            b"shared".to_vec(),
+        );
+        filesystem.add_file(
+            "/root/library/alpha system/Alpha Extra.bin",
+            b"alpha".to_vec(),
+        );
+        filesystem.add_directory("/root/library/Zulu System");
+        filesystem.add_file(
+            "/root/library/Zulu System/Zulu Shared.bin",
+            b"shared".to_vec(),
+        );
+        filesystem.add_file("/root/library/Zulu System/Zulu Extra.bin", b"zulu".to_vec());
+        filesystem.add_file("/root/work/download.bin", b"unique".to_vec());
+        let catalogs = [
+            named_catalog(
+                "Zulu System",
+                vec![GameSpec {
+                    name: "Zulu Source".into(),
+                    roms: vec![
+                        rom("Zulu Shared.bin", b"shared"),
+                        rom("Zulu Extra.bin", b"zulu"),
+                    ],
+                }],
+            ),
+            named_catalog(
+                "alpha system",
+                vec![GameSpec {
+                    name: "Alpha Source".into(),
+                    roms: vec![
+                        rom("Alpha Shared.bin", b"shared"),
+                        rom("Alpha Extra.bin", b"alpha"),
+                    ],
+                }],
+            ),
+            named_catalog(
+                "Target System",
+                vec![GameSpec {
+                    name: "Target".into(),
+                    roms: vec![
+                        rom("Target Unique.bin", b"unique"),
+                        rom("Target Shared.bin", b"shared"),
+                    ],
+                }],
+            ),
+        ];
+        let mut cache = SqliteCache::in_memory().unwrap();
+        let mut library_sources = Vec::new();
+
+        execute_with_progress(&filesystem, &mut cache, &config, &catalogs, &mut |event| {
+            if let ProgressEvent::CopyingLibraryRom { source, .. } = event {
+                library_sources.push(source.clone());
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            library_sources,
+            vec![PathBuf::from("library/alpha system/Alpha Shared.bin")]
+        );
+    }
+
+    #[test]
+    fn library_copy_repeats_content_the_required_number_of_times() {
+        let (filesystem, config) = fixture();
+        filesystem.add_directory("/root/library/System");
+        filesystem.add_file("/root/library/System/Source.bin", b"shared".to_vec());
+        filesystem.add_file("/root/work/download.bin", b"unique".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Source".into(),
+                roms: vec![rom("Source.bin", b"shared")],
+            },
+            GameSpec {
+                name: "Target".into(),
+                roms: vec![
+                    rom("Target Unique.bin", b"unique"),
+                    rom("Target Copy A.bin", b"shared"),
+                    rom("Target Copy B.bin", b"shared"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.library_copies, 2);
+        assert_eq!(summary.promotions, 1);
+        for filename in ["Target Copy A.bin", "Target Copy B.bin"] {
+            assert_eq!(
+                filesystem.contents(Path::new("/root/library/System").join(filename)),
+                Some(b"shared".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn newly_promoted_game_is_an_immediate_library_source_without_a_rescan() {
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/a-source-seed.bin", b"source seed".to_vec());
+        filesystem.add_file("/root/work/b-source-shared.bin", b"shared".to_vec());
+        filesystem.add_file("/root/work/z-target-download.bin", b"unique".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "A Source".into(),
+                roms: vec![
+                    rom("Source Seed.bin", b"source seed"),
+                    rom("Source Shared.bin", b"shared"),
+                ],
+            },
+            GameSpec {
+                name: "B Target".into(),
+                roms: vec![
+                    rom("Target Unique.bin", b"unique"),
+                    rom("Target Shared.bin", b"shared"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.promotions, 2);
+        assert_eq!(summary.library_copies, 1);
+        assert_eq!(filesystem.read_directory_calls(), 3);
+        assert_eq!(
+            filesystem.contents("/root/library/System/Target Shared.bin"),
+            Some(b"shared".to_vec())
+        );
+    }
+
+    #[test]
+    fn preserves_leftovers_even_when_their_hash_exists_in_the_library() {
         let (filesystem, config) = fixture();
         filesystem.add_directory("/root/library/System");
         filesystem.add_file("/root/library/System/One.bin", b"shared".to_vec());
@@ -1868,13 +3192,13 @@ mod tests {
 
         let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
 
-        assert!(!filesystem.contains("/root/work/lone-copy.bin"));
+        assert!(filesystem.contains("/root/work/lone-copy.bin"));
         assert!(filesystem.contains("/root/work/leftover.cue"));
-        assert_eq!(summary.redundant_leftovers_removed, 1);
+        assert_eq!(summary.remaining_leftovers, 2);
     }
 
     #[test]
-    fn removes_only_selected_work_copies_of_a_verified_existing_game() {
+    fn leaves_work_copies_of_a_verified_existing_game_untouched() {
         let (filesystem, config) = fixture();
         filesystem.add_directory("/root/library/System");
         filesystem.add_file("/root/library/System/Game.bin", b"payload".to_vec());
@@ -1888,14 +3212,13 @@ mod tests {
 
         let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
 
-        assert!(!filesystem.contains("/root/work/copy.bin"));
+        assert!(filesystem.contains("/root/work/copy.bin"));
         assert!(filesystem.contains("/root/work/unrelated.bin"));
-        assert_eq!(summary.existing_duplicates_removed, 1);
-        assert_eq!(summary.redundant_leftovers_removed, 0);
+        assert_eq!(summary.promotions, 0);
     }
 
     #[test]
-    fn assigns_shared_leftovers_to_the_largest_game_group() {
+    fn fixed_queue_claims_supporting_files_for_the_first_winner() {
         let (filesystem, config) = fixture();
         filesystem.add_file("/root/work/a-shared.bin", b"shared".to_vec());
         filesystem.add_file("/root/work/b-secondary.bin", b"secondary".to_vec());
@@ -1961,22 +3284,6 @@ mod tests {
             summary.leftover_details,
             vec![
                 LeftoverDetail {
-                    system: "alpha system".into(),
-                    game: "Tie".into(),
-                    matches: vec![
-                        LeftoverMatch {
-                            expected_rom: "Other Tie Missing.bin".into(),
-                            work_path: None,
-                            status: LeftoverStatus::Missing,
-                        },
-                        LeftoverMatch {
-                            expected_rom: "Other Tie.bin".into(),
-                            work_path: Some("c-tie.bin".into()),
-                            status: LeftoverStatus::Ok,
-                        },
-                    ],
-                },
-                LeftoverDetail {
                     system: "System".into(),
                     game: "Alpha".into(),
                     matches: vec![
@@ -1997,17 +3304,250 @@ mod tests {
                         },
                     ],
                 },
+                LeftoverDetail {
+                    system: "alpha system".into(),
+                    game: "Tie".into(),
+                    matches: vec![
+                        LeftoverMatch {
+                            expected_rom: "Other Tie Missing.bin".into(),
+                            work_path: None,
+                            status: LeftoverStatus::Missing,
+                        },
+                        LeftoverMatch {
+                            expected_rom: "Other Tie.bin".into(),
+                            work_path: Some("c-tie.bin".into()),
+                            status: LeftoverStatus::Ok,
+                        },
+                    ],
+                },
             ]
         );
-        assert!(format!("{summary}").contains(concat!(
-            "Incomplete: alpha system / Tie\n",
-            "  Other Tie Missing.bin [MISSING]\n",
-            "  Other Tie.bin -> c-tie.bin [OK]\n",
-            "Incomplete: System / Alpha\n",
-            "  Alpha Missing.bin [MISSING]\n",
-            "  Alpha Secondary.bin -> b-secondary.bin [OK]\n",
-            "  Alpha Shared.bin -> a-shared.bin [OK]\n",
-        )));
+        assert!(!format!("{summary}").contains("Incomplete:"));
+    }
+
+    #[test]
+    fn priority_queue_processes_the_fewest_candidate_seed_first() {
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/a-ambiguous.bin", b"shared".to_vec());
+        filesystem.add_file("/root/work/z-unique.bin", b"unique".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Alpha".into(),
+                roms: vec![
+                    rom("Alpha Shared.bin", b"shared"),
+                    rom("Alpha Unique.bin", b"unique"),
+                    rom("Alpha Missing.bin", b"missing"),
+                ],
+            },
+            GameSpec {
+                name: "Beta".into(),
+                roms: vec![
+                    rom("Beta Shared.bin", b"shared"),
+                    rom("Beta Missing.bin", b"beta missing"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.leftover_details.len(), 1);
+        let alpha = &summary.leftover_details[0];
+        assert_eq!(alpha.game, "Alpha");
+        assert_eq!(
+            alpha
+                .matches
+                .iter()
+                .filter(|rom| rom.status == LeftoverStatus::Ok)
+                .count(),
+            2
+        );
+        assert_eq!(
+            alpha
+                .matches
+                .iter()
+                .find(|rom| rom.expected_rom == "Alpha Shared.bin")
+                .expect("the supporting ambiguous file is claimed")
+                .work_path
+                .as_deref(),
+            Some("a-ambiguous.bin")
+        );
+    }
+
+    #[test]
+    fn priority_queue_uses_work_filename_to_break_candidate_count_ties() {
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/a-seed.bin", b"zulu seed".to_vec());
+        filesystem.add_file("/root/work/B-seed.bin", b"alpha seed".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Alpha".into(),
+                roms: vec![
+                    rom("Alpha Seed.bin", b"alpha seed"),
+                    rom("Alpha Missing.bin", b"alpha missing"),
+                ],
+            },
+            GameSpec {
+                name: "Zulu".into(),
+                roms: vec![
+                    rom("Zulu Seed.bin", b"zulu seed"),
+                    rom("Zulu Missing.bin", b"zulu missing"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(
+            summary
+                .leftover_details
+                .iter()
+                .map(|detail| detail.game.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Zulu", "Alpha"]
+        );
+    }
+
+    #[test]
+    fn filename_only_matches_do_not_create_content_queue_candidates() {
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/Game.bin", b"wrong".to_vec());
+        let catalogs = [catalog(vec![GameSpec {
+            name: "Game".into(),
+            roms: vec![rom("Game.bin", b"expected")],
+        }])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert!(summary.leftover_details.is_empty());
+        assert_eq!(summary.unknown_files, 1);
+        assert!(filesystem.contains("/root/work/Game.bin"));
+    }
+
+    #[test]
+    fn displayed_mismatch_is_claimed_before_its_own_queue_item() {
+        let (filesystem, config) = fixture();
+        filesystem.add_file("/root/work/a-alpha-seed.bin", b"alpha seed".to_vec());
+        filesystem.add_file("/root/work/Alpha Missing.bin", b"beta seed".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Alpha".into(),
+                roms: vec![
+                    rom("Alpha Seed.bin", b"alpha seed"),
+                    rom("Alpha Missing.bin", b"alpha expected"),
+                ],
+            },
+            GameSpec {
+                name: "Beta".into(),
+                roms: vec![
+                    rom("Beta Seed.bin", b"beta seed"),
+                    rom("Beta Missing.bin", b"beta missing"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.leftover_details.len(), 1);
+        assert_eq!(summary.leftover_details[0].game, "Alpha");
+        assert_eq!(
+            summary.leftover_details[0]
+                .matches
+                .iter()
+                .find(|rom| rom.expected_rom == "Alpha Missing.bin")
+                .expect("exact-name mismatch is displayed")
+                .status,
+            LeftoverStatus::Mismatch
+        );
+    }
+
+    #[test]
+    fn complete_candidate_beats_an_alphabetically_earlier_incomplete_candidate() {
+        let (filesystem, config) = fixture();
+        filesystem.add_directory("/root/library/System");
+        filesystem.add_file("/root/library/System/Source Extra.bin", b"extra".to_vec());
+        filesystem.add_file("/root/work/seed.bin", b"shared".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Source".into(),
+                roms: vec![rom("Source Extra.bin", b"extra")],
+            },
+            GameSpec {
+                name: "Alpha Incomplete".into(),
+                roms: vec![
+                    rom("Alpha Shared.bin", b"shared"),
+                    rom("Alpha Missing.bin", b"missing"),
+                ],
+            },
+            GameSpec {
+                name: "Zulu Complete".into(),
+                roms: vec![
+                    rom("Zulu Shared.bin", b"shared"),
+                    rom("Zulu Extra.bin", b"extra"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.promotions, 1);
+        assert_eq!(summary.library_copies, 1);
+        assert_eq!(summary.leftover_details, Vec::new());
+        assert!(filesystem.contains("/root/library/System/Zulu Shared.bin"));
+        assert!(!filesystem.contains("/root/library/System/Alpha Shared.bin"));
+    }
+
+    #[test]
+    fn incomplete_winner_score_includes_verified_library_content() {
+        let (filesystem, config) = fixture();
+        filesystem.add_directory("/root/library/System");
+        filesystem.add_file("/root/library/System/Source Extra.bin", b"extra".to_vec());
+        filesystem.add_file("/root/work/seed.bin", b"shared".to_vec());
+        let catalogs = [catalog(vec![
+            GameSpec {
+                name: "Source".into(),
+                roms: vec![rom("Source Extra.bin", b"extra")],
+            },
+            GameSpec {
+                name: "Alpha".into(),
+                roms: vec![
+                    rom("Alpha Shared.bin", b"shared"),
+                    rom("Alpha Missing.bin", b"alpha missing"),
+                ],
+            },
+            GameSpec {
+                name: "Zulu".into(),
+                roms: vec![
+                    rom("Zulu Shared.bin", b"shared"),
+                    rom("Zulu Extra.bin", b"extra"),
+                    rom("Zulu Missing.bin", b"zulu missing"),
+                ],
+            },
+        ])];
+        let mut cache = SqliteCache::in_memory().unwrap();
+
+        let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
+
+        assert_eq!(summary.leftover_details.len(), 1);
+        assert_eq!(summary.leftover_details[0].game, "Zulu");
+        assert_eq!(
+            summary.leftover_details[0]
+                .matches
+                .iter()
+                .find(|rom| rom.expected_rom == "Zulu Extra.bin")
+                .expect("verified library content contributes to the score")
+                .status,
+            LeftoverStatus::Library
+        );
+        assert!(format!("{}", summary.leftover_details[0]).contains("Zulu Extra.bin [LIBRARY]"));
+        assert!(
+            format!("{}", summary.leftover_details[0].colored())
+                .contains("Zulu Extra.bin \x1b[33m[LIBRARY]\x1b[0m")
+        );
     }
 
     #[test]
@@ -2031,10 +3571,21 @@ mod tests {
 
         let summary = execute(&filesystem, &mut cache, &config, &catalogs).unwrap();
 
-        assert_eq!(summary.unknown_files, 0);
+        assert_eq!(summary.unknown_files, 1);
+        let detail = summary
+            .leftover_details
+            .iter()
+            .rev()
+            .find(|detail| {
+                detail
+                    .matches
+                    .iter()
+                    .any(|rom| rom.expected_rom == "alpha.bin" && rom.status == LeftoverStatus::Ok)
+            })
+            .expect("content processing emits the detailed incomplete result");
         assert_eq!(
-            summary.leftover_details,
-            vec![LeftoverDetail {
+            detail,
+            &LeftoverDetail {
                 system: "System".into(),
                 game: "Game".into(),
                 matches: vec![
@@ -2064,9 +3615,9 @@ mod tests {
                         status: LeftoverStatus::Mismatch,
                     },
                 ],
-            }]
+            }
         );
-        assert!(format!("{summary}").contains(concat!(
+        assert!(format!("{detail}").contains(concat!(
             "Incomplete: System / Game\n",
             "  alpha.bin -> download.bin [OK]\n",
             "  Exact.bin [OK]\n",
@@ -2074,12 +3625,13 @@ mod tests {
             "  Missing.bin [MISSING]\n",
             "  zBad.bin [MISMATCH]\n",
         )));
-        let colored = format!("{}", summary.colored());
-        assert!(colored.contains("\x1b[33mIncomplete:\x1b[0m System / Game"));
+        let colored = format!("{}", detail.colored());
+        assert!(colored.contains("\x1b[96mIncomplete:\x1b[0m System / Game"));
         assert!(colored.contains("zBad.bin \x1b[38;5;208m[MISMATCH]\x1b[0m"));
         assert!(colored.contains("Exact.bin \x1b[32m[OK]\x1b[0m"));
         assert!(colored.contains("Missing.bin \x1b[31m[MISSING]\x1b[0m"));
         assert!(!format!("{summary}").contains('\x1b'));
+        assert!(!format!("{summary}").contains("Incomplete:"));
     }
 
     #[test]

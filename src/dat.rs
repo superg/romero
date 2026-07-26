@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use quick_xml::Reader;
 use quick_xml::encoding::Decoder;
-use quick_xml::escape::unescape;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::escape::{resolve_xml_entity, unescape};
+use quick_xml::events::{BytesCData, BytesRef, BytesStart, Event};
 use zip::ZipArchive;
 
 use crate::error::{Result, RomeroError};
@@ -125,11 +125,11 @@ fn load_zip_dats(path: &Path, catalogs: &mut Vec<DatCatalog>) -> Result<()> {
 
 pub(crate) fn parse_dat(reader: impl std::io::BufRead, source: String) -> Result<DatCatalog> {
     let mut reader = Reader::from_reader(reader);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
 
     let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut header_name = None;
-    let mut header_date = None;
+    let mut header_name = String::new();
+    let mut header_date = String::new();
     let mut games = Vec::new();
     let mut current_game: Option<GameSpec> = None;
     let mut buffer = Vec::new();
@@ -167,10 +167,21 @@ pub(crate) fn parse_dat(reader: impl std::io::BufRead, source: String) -> Result
                 stack.pop();
             }
             Event::Text(text) => {
-                if path_is(&stack, &[b"datafile", b"header", b"name"]) {
-                    header_name = Some(decode_text(&text, &source)?);
-                } else if path_is(&stack, &[b"datafile", b"header", b"date"]) {
-                    header_date = Some(decode_text(&text, &source)?);
+                if let Some(target) = header_text_target(&stack, &mut header_name, &mut header_date)
+                {
+                    target.push_str(&decode_text(&text, &source)?);
+                }
+            }
+            Event::CData(text) => {
+                if let Some(target) = header_text_target(&stack, &mut header_name, &mut header_date)
+                {
+                    target.push_str(&decode_cdata(&text, &source)?);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some(target) = header_text_target(&stack, &mut header_name, &mut header_date)
+                {
+                    target.push_str(&decode_reference(&reference, &source)?);
                 }
             }
             Event::End(_) => {
@@ -188,13 +199,15 @@ pub(crate) fn parse_dat(reader: impl std::io::BufRead, source: String) -> Result
         buffer.clear();
     }
 
-    let name = header_name
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| RomeroError::Dat(format!("missing header name in {source}")))?;
-    validate_target_name(&name, "DAT header name", &source)?;
-    let date_text = header_date
-        .filter(|date| !date.is_empty())
-        .ok_or_else(|| RomeroError::Dat(format!("missing header date in {source}")))?;
+    let name = header_name.trim().to_owned();
+    if name.is_empty() {
+        return Err(RomeroError::Dat(format!("missing header name in {source}")));
+    }
+    sanitize_header_name(&name, &source)?;
+    let date_text = header_date.trim().to_owned();
+    if date_text.is_empty() {
+        return Err(RomeroError::Dat(format!("missing header date in {source}")));
+    }
     let date = parse_date(&date_text).ok_or_else(|| {
         RomeroError::Dat(format!("invalid header date {date_text:?} in {source}"))
     })?;
@@ -266,6 +279,41 @@ fn decode_text(text: &quick_xml::events::BytesText<'_>, source: &str) -> Result<
     unescape(&decoded)
         .map(|text| text.into_owned())
         .map_err(|error| RomeroError::Dat(format!("invalid XML escape in {source}: {error}")))
+}
+
+fn decode_cdata(text: &BytesCData<'_>, source: &str) -> Result<String> {
+    text.xml_content()
+        .map(|text| text.into_owned())
+        .map_err(|error| RomeroError::Dat(format!("invalid XML text in {source}: {error}")))
+}
+
+fn decode_reference(reference: &BytesRef<'_>, source: &str) -> Result<String> {
+    if let Some(character) = reference
+        .resolve_char_ref()
+        .map_err(|error| RomeroError::Dat(format!("invalid XML reference in {source}: {error}")))?
+    {
+        return Ok(character.to_string());
+    }
+    let name = reference
+        .xml_content()
+        .map_err(|error| RomeroError::Dat(format!("invalid XML reference in {source}: {error}")))?;
+    resolve_xml_entity(&name)
+        .map(str::to_owned)
+        .ok_or_else(|| RomeroError::Dat(format!("unknown XML entity &{name}; in {source}")))
+}
+
+fn header_text_target<'a>(
+    stack: &[Vec<u8>],
+    header_name: &'a mut String,
+    header_date: &'a mut String,
+) -> Option<&'a mut String> {
+    if path_is(stack, &[b"datafile", b"header", b"name"]) {
+        Some(header_name)
+    } else if path_is(stack, &[b"datafile", b"header", b"date"]) {
+        Some(header_date)
+    } else {
+        None
+    }
 }
 
 fn path_is(stack: &[Vec<u8>], expected: &[&[u8]]) -> bool {
@@ -406,16 +454,18 @@ fn select_catalogs(catalogs: Vec<DatCatalog>) -> Result<Vec<DatCatalog>> {
         selected.push(newest.into_iter().next().expect("newest DAT exists"));
     }
 
-    let mut folded_names = BTreeMap::<String, String>::new();
-    for catalog in &selected {
-        if let Some(previous) =
-            folded_names.insert(catalog.name.to_lowercase(), catalog.name.clone())
+    let mut managed_names = BTreeMap::<String, (String, String)>::new();
+    for catalog in &mut selected {
+        let original = catalog.name.clone();
+        let managed = sanitize_header_name(&original, &catalog.source)?;
+        if let Some((previous_original, previous_managed)) =
+            managed_names.insert(managed.to_lowercase(), (original.clone(), managed.clone()))
         {
             return Err(RomeroError::Dat(format!(
-                "case-insensitive system directory collision between {previous:?} and {:?}",
-                catalog.name
+                "DAT header names {previous_original:?} and {original:?} resolve to colliding system directories {previous_managed:?} and {managed:?}"
             )));
         }
+        catalog.name = managed;
     }
 
     let mut content_sets = BTreeMap::<Vec<String>, (String, String)>::new();
@@ -455,13 +505,50 @@ fn validate_target_name(name: &str, label: &str, source: &str) -> Result<()> {
         )));
     }
 
+    if is_reserved_windows_name(name) {
+        return Err(RomeroError::Dat(format!(
+            "reserved {label} {name:?} in {source}"
+        )));
+    }
+    Ok(())
+}
+
+fn sanitize_header_name(name: &str, source: &str) -> Result<String> {
+    let mut sanitized = String::with_capacity(name.len());
+    for character in name.chars() {
+        if character.is_control()
+            || matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            )
+        {
+            sanitized.push('_');
+        } else {
+            sanitized.push(character);
+        }
+    }
+    while sanitized.ends_with([' ', '.']) {
+        sanitized.pop();
+    }
+    if sanitized.is_empty() {
+        return Err(RomeroError::Dat(format!(
+            "DAT header name {name:?} becomes empty after sanitization in {source}"
+        )));
+    }
+    if is_reserved_windows_name(&sanitized) {
+        sanitized.insert(0, '_');
+    }
+    Ok(sanitized)
+}
+
+fn is_reserved_windows_name(name: &str) -> bool {
     let stem = name
         .split('.')
         .next()
         .unwrap_or(name)
         .trim_end()
         .to_ascii_uppercase();
-    let reserved = matches!(
+    matches!(
         stem.as_str(),
         "CON"
             | "PRN"
@@ -485,13 +572,7 @@ fn validate_target_name(name: &str, label: &str, source: &str) -> Result<()> {
             | "LPT7"
             | "LPT8"
             | "LPT9"
-    );
-    if reserved {
-        return Err(RomeroError::Dat(format!(
-            "reserved {label} {name:?} in {source}"
-        )));
-    }
-    Ok(())
+    )
 }
 
 fn has_extension(path: &Path, extension: &str) -> bool {
@@ -534,6 +615,16 @@ mod tests {
         assert_eq!(dat.name, "Sony - PlayStation");
         assert_eq!(dat.games[0].roms[1].name, "Demo.bin");
         assert_eq!(dat.games[0].roms[1].size, 20);
+    }
+
+    #[test]
+    fn decodes_and_preserves_escaped_header_name_text() {
+        let xml = sample("2026-07-24 13-57-31", "")
+            .replace("Sony - PlayStation", "Sega - Mega CD &amp; Sega CD");
+
+        let dat = parse_dat(Cursor::new(xml), "escaped.dat".into()).unwrap();
+
+        assert_eq!(dat.name, "Sega - Mega CD & Sega CD");
     }
 
     #[test]
@@ -603,6 +694,30 @@ mod tests {
         .unwrap();
         let newest = parse_dat(Cursor::new(&newest_xml), "newest.dat".into()).unwrap();
         assert!(select_catalogs(vec![newest, conflict]).is_err());
+    }
+
+    #[test]
+    fn sanitizes_header_names_and_rejects_managed_name_collisions() {
+        let dotted_xml = sample("2026-01-01 00-00-00", "")
+            .replace("Sony - PlayStation", "Hasbro - VideoNow Jr.");
+        let dotted = parse_dat(Cursor::new(dotted_xml), "dotted.dat".into()).unwrap();
+        assert_eq!(dotted.name, "Hasbro - VideoNow Jr.");
+
+        let selected = select_catalogs(vec![dotted]).unwrap();
+        assert_eq!(selected[0].name, "Hasbro - VideoNow Jr");
+
+        assert_eq!(
+            sanitize_header_name(r#"Arcade: "Test"?"#, "memory.dat").unwrap(),
+            "Arcade_ _Test__"
+        );
+        assert_eq!(sanitize_header_name("CON", "memory.dat").unwrap(), "_CON");
+
+        let plain_xml = sample("2026-01-01 00-00-00", "").replace("Sony - PlayStation", "System");
+        let dotted_xml = sample("2026-01-01 00-00-00", "").replace("Sony - PlayStation", "System.");
+        let plain = parse_dat(Cursor::new(plain_xml), "plain.dat".into()).unwrap();
+        let dotted = parse_dat(Cursor::new(dotted_xml), "dotted.dat".into()).unwrap();
+
+        assert!(select_catalogs(vec![plain, dotted]).is_err());
     }
 
     #[test]

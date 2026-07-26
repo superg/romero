@@ -18,8 +18,8 @@ pub(crate) struct CacheRecord {
 pub(crate) trait CacheStore {
     fn get(&self, area: &str, path: &str) -> Result<Option<CacheRecord>>;
     fn put(&mut self, record: &CacheRecord) -> Result<()>;
-    fn remove(&mut self, area: &str, path: &str) -> Result<()>;
-    fn retain(&mut self, seen: &BTreeSet<(String, String)>) -> Result<()>;
+    fn remove(&mut self, area: &str, path: &str) -> Result<bool>;
+    fn retain(&mut self, seen: &BTreeSet<(String, String)>) -> Result<bool>;
     fn checkpoint(&mut self) -> Result<()>;
     fn commit(&mut self) -> Result<()>;
 }
@@ -144,17 +144,18 @@ impl CacheStore for SqliteCache {
         Ok(())
     }
 
-    fn remove(&mut self, area: &str, path: &str) -> Result<()> {
-        self.connection
+    fn remove(&mut self, area: &str, path: &str) -> Result<bool> {
+        let removed = self
+            .connection
             .execute(
                 "DELETE FROM files WHERE area = ?1 AND path = ?2",
                 params![area, path],
             )
             .map_err(cache_error)?;
-        Ok(())
+        Ok(removed != 0)
     }
 
-    fn retain(&mut self, seen: &BTreeSet<(String, String)>) -> Result<()> {
+    fn retain(&mut self, seen: &BTreeSet<(String, String)>) -> Result<bool> {
         let mut rows_by_key = BTreeMap::new();
         {
             let mut statement = self
@@ -171,12 +172,13 @@ impl CacheStore for SqliteCache {
                 rows_by_key.insert(key.clone(), key);
             }
         }
+        let mut changed = false;
         for (area, path) in rows_by_key.into_keys() {
             if !seen.contains(&(area.clone(), path.clone())) {
-                self.remove(&area, &path)?;
+                changed |= self.remove(&area, &path)?;
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn checkpoint(&mut self) -> Result<()> {

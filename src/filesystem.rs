@@ -188,6 +188,9 @@ mod memory {
         fail_next_read: Cell<bool>,
         fail_next_rename: Cell<bool>,
         fail_next_write: Cell<bool>,
+        read_directory_calls: Cell<usize>,
+        metadata_calls: Cell<usize>,
+        read_calls: Cell<usize>,
     }
 
     impl MemoryFileSystem {
@@ -253,6 +256,18 @@ mod memory {
             self.fail_next_write.set(true);
         }
 
+        pub(crate) fn read_directory_calls(&self) -> usize {
+            self.read_directory_calls.get()
+        }
+
+        pub(crate) fn metadata_calls(&self) -> usize {
+            self.metadata_calls.get()
+        }
+
+        pub(crate) fn read_calls(&self) -> usize {
+            self.read_calls.get()
+        }
+
         fn tick(&self) -> i64 {
             let next = self.clock.get() + 1;
             self.clock.set(next);
@@ -262,6 +277,8 @@ mod memory {
 
     impl FileSystem for MemoryFileSystem {
         fn read_directory(&self, path: &Path) -> Result<Vec<DirectoryEntry>> {
+            self.read_directory_calls
+                .set(self.read_directory_calls.get() + 1);
             if !matches!(self.nodes.borrow().get(path), Some(Node::Directory)) {
                 return Err(RomeroError::Operational(format!(
                     "memory path is not a directory: {}",
@@ -307,6 +324,7 @@ mod memory {
         }
 
         fn metadata(&self, path: &Path) -> Result<Option<FileMetadata>> {
+            self.metadata_calls.set(self.metadata_calls.get() + 1);
             Ok(self.nodes.borrow().get(path).map(|node| match node {
                 Node::File {
                     contents,
@@ -349,6 +367,7 @@ mod memory {
         }
 
         fn read(&self, path: &Path) -> Result<Vec<u8>> {
+            self.read_calls.set(self.read_calls.get() + 1);
             if self.fail_next_read.replace(false) {
                 return Err(RomeroError::Operational("injected read failure".into()));
             }

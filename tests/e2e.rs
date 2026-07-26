@@ -88,7 +88,7 @@ fn reconciles_cue_game_and_reuses_cache_after_root_relocation() {
 }
 
 #[test]
-fn promotes_multiple_complete_cue_games_sequentially() {
+fn content_queue_promotes_multiple_complete_cue_games() {
     let root = tempdir().unwrap();
     prepare_roots(root.path());
     let first_bin = b"first disc bytes";
@@ -158,7 +158,7 @@ fn promotes_multiple_complete_cue_games_sequentially() {
 }
 
 #[test]
-fn each_completed_hash_survives_interruption_before_the_next_file() {
+fn uncommitted_hash_batch_is_rebuilt_after_interruption() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     let root = tempdir().unwrap();
@@ -183,29 +183,31 @@ fn each_completed_hash_survives_interruption_before_the_next_file() {
     let resumed =
         run_with_progress(root.path(), |event| resumed_events.push(event.clone())).unwrap();
 
-    assert_eq!(resumed.cache_hits, 1);
-    assert_eq!(resumed.cache_misses, 1);
-    assert!(resumed_events.contains(&ProgressEvent::CacheHit {
+    assert_eq!(resumed.cache_hits, 0);
+    assert_eq!(resumed.cache_misses, 2);
+    assert!(resumed_events.contains(&ProgressEvent::Hashing {
         path: Path::new("work/first.bin").to_path_buf(),
+        size: 5,
     }));
     assert!(resumed_events.contains(&ProgressEvent::Hashing {
         path: Path::new("work/second.bin").to_path_buf(),
         size: 6,
     }));
     assert!(resumed_events.contains(&ProgressEvent::HashSaved {
+        path: Path::new("work/first.bin").to_path_buf(),
+    }));
+    assert!(resumed_events.contains(&ProgressEvent::HashSaved {
         path: Path::new("work/second.bin").to_path_buf(),
     }));
-    assert!(!resumed_events.iter().any(|event| {
-        matches!(
-            event,
-            ProgressEvent::Hashing { path, .. }
-                if path == Path::new("work/first.bin")
-        )
-    }));
+    assert!(
+        !resumed_events
+            .iter()
+            .any(|event| { matches!(event, ProgressEvent::CacheHit { .. }) })
+    );
 }
 
 #[test]
-fn loads_dat_entries_from_zip_without_extracting_them() {
+fn loads_zip_dat_and_sanitizes_its_header_name() {
     let root = tempdir().unwrap();
     prepare_roots(root.path());
     let payload = b"zip catalog payload";
@@ -223,7 +225,7 @@ fn loads_dat_entries_from_zip_without_extracting_them() {
         )
         .unwrap();
     writer
-        .write_all(dat("Archive System", &game).as_bytes())
+        .write_all(dat("Hasbro - VideoNow Jr.", &game).as_bytes())
         .unwrap();
     writer.finish().unwrap();
     fs::write(root.path().join("work/unrecognized-name.rom"), payload).unwrap();
@@ -231,9 +233,19 @@ fn loads_dat_entries_from_zip_without_extracting_them() {
     run(root.path()).unwrap();
 
     assert_eq!(
-        fs::read(root.path().join("library/Archive System/Archive Game.rom")).unwrap(),
+        fs::read(
+            root.path()
+                .join("library/Hasbro - VideoNow Jr/Archive Game.rom")
+        )
+        .unwrap(),
         payload
     );
+    assert!(
+        root.path()
+            .join("library/Hasbro - VideoNow Jr.miss")
+            .is_file()
+    );
+    assert!(!root.path().join("library/Hasbro - VideoNow Jr.").exists());
     assert!(!root.path().join("nested").exists());
 }
 
@@ -334,7 +346,7 @@ fn concurrent_run_fails_immediately_on_the_exclusive_cache_lock() {
 
 #[cfg(unix)]
 #[test]
-fn moved_hash_remains_cached_after_a_post_promotion_report_failure() {
+fn moved_hash_is_rebuilt_after_a_post_promotion_rollback() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = tempdir().unwrap();
@@ -357,8 +369,8 @@ fn moved_hash_remains_cached_after_a_post_promotion_report_failure() {
     assert!(failed.is_err());
     assert!(root.path().join("library/System/Game.bin").is_file());
     let recovered = run(root.path()).unwrap();
-    assert_eq!(recovered.cache_hits, 1);
-    assert_eq!(recovered.cache_misses, 0);
+    assert_eq!(recovered.cache_hits, 0);
+    assert_eq!(recovered.cache_misses, 1);
     assert_eq!(
         fs::read(root.path().join("library/System.miss")).unwrap(),
         b""

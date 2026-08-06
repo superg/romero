@@ -51,14 +51,16 @@ workflow for bringing a ROM set back in line with its latest catalogs.
 
 ### Installation
 
-Install the current version directly from GitHub:
+Download the ZIP for your platform from the
+[latest GitHub release](https://github.com/superg/romero/releases/latest), then
+extract the `romero` executable somewhere on your `PATH`. Each archive contains
+only the executable, with no additional runtime files.
+
+To build and install Romero from source instead, run:
 
 ```bash
 cargo install --git https://github.com/superg/romero --locked
 ```
-
-> **Note:** Prebuilt binaries are not available yet. Automated CI release builds
-> will be added later.
 
 ### Workflow
 

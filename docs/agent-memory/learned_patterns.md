@@ -44,3 +44,5 @@
 - Keep Romero's tests source-adjacent and unit-only. Disable Cargo integration-test auto-discovery, run `cargo test --lib`, and use only inline data with in-memory collaborators; do not invoke public OS-backed entry points or the CLI from tests.
 - Route configuration inspection and DAT discovery through the same internal filesystem abstraction used by the engine. This preserves production behavior while letting each module exercise path kinds, validation ordering, direct readers, and ZIP bytes independently with `MemoryFileSystem`.
 - SQLite unit tests must use `Connection::open_in_memory()` with `temp_store=MEMORY`; share schema and transaction initialization with production while leaving file-backed locking and OS behavior outside the unit-test boundary.
+- Key GitHub Actions concurrency by workflow and full Git ref so newer commits cancel obsolete work on the same branch, pull request, or force-updated tag without cancelling unrelated refs.
+- Build every release target before publishing, keep each ZIP to one root-level executable, and make the final GitHub Release step rerunnable by clobbering same-named assets on an existing release.

@@ -46,3 +46,4 @@
 - SQLite unit tests must use `Connection::open_in_memory()` with `temp_store=MEMORY`; share schema and transaction initialization with production while leaving file-backed locking and OS behavior outside the unit-test boundary.
 - Key GitHub Actions concurrency by workflow and full Git ref so newer commits cancel obsolete work on the same branch, pull request, or force-updated tag without cancelling unrelated refs.
 - Build every release target before publishing, keep each ZIP to one root-level executable, and make the final GitHub Release step rerunnable by clobbering same-named assets on an existing release.
+- Set `GH_REPO` from `github.repository` when a checkout-free Actions job uses GitHub CLI; otherwise `gh` tries to discover the repository from a missing local `.git` directory.

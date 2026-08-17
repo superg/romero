@@ -1131,7 +1131,7 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
             self.summary.quarantined_directories += 1;
         }
         if let Ok(relative) = entry.path.strip_prefix(&self.config.library_path) {
-            let key = relative_cache_key(relative);
+            let key = relative_cache_key(relative)?;
             self.cache_remove(LIBRARY_AREA, &key)?;
         }
         Ok(())
@@ -1795,7 +1795,7 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
         let relative = path.strip_prefix(area_root).map_err(|_| {
             RomeroError::Operational(format!("{} is outside managed {area} path", path.display()))
         })?;
-        let cache_key = relative_cache_key(relative);
+        let cache_key = relative_cache_key(relative)?;
         let accounting_key = (area.to_owned(), cache_key.clone());
         let first_seen = self.accounted_cache_keys.insert(accounting_key);
         let cached = self.cache.get(area, &cache_key)?;
@@ -1904,7 +1904,7 @@ impl<F: FileSystem, C: CacheStore> Engine<'_, F, C> {
         let relative = path.strip_prefix(area_root).map_err(|_| {
             RomeroError::Operational(format!("{} is outside {area}", path.display()))
         })?;
-        let cache_key = relative_cache_key(relative);
+        let cache_key = relative_cache_key(relative)?;
         self.cache_put(&CacheRecord {
             area: area.to_owned(),
             path: cache_key.clone(),
@@ -2058,7 +2058,7 @@ mod tests {
             absolute_path: Path::new("/root/work").join(name),
             relative_path: PathBuf::from(name),
             name: OsString::from(name),
-            cache_key: relative_cache_key(Path::new(name)),
+            cache_key: relative_cache_key(Path::new(name)).unwrap(),
             size: contents.len() as u64,
             modified_ns: 1,
             sha1: sha1_bytes(contents),
@@ -2251,7 +2251,7 @@ mod tests {
             cache
                 .get(
                     LIBRARY_AREA,
-                    &relative_cache_key(Path::new("System/First.bin"))
+                    &relative_cache_key(Path::new("System/First.bin")).unwrap()
                 )
                 .unwrap()
                 .is_some()
@@ -2260,7 +2260,7 @@ mod tests {
             cache
                 .get(
                     LIBRARY_AREA,
-                    &relative_cache_key(Path::new("System/Second.bin"))
+                    &relative_cache_key(Path::new("System/Second.bin")).unwrap()
                 )
                 .unwrap()
                 .is_some()
@@ -2269,7 +2269,7 @@ mod tests {
             cache
                 .get(
                     WORK_AREA,
-                    &relative_cache_key(Path::new("first-download.bin"))
+                    &relative_cache_key(Path::new("first-download.bin")).unwrap()
                 )
                 .unwrap()
                 .is_none()
@@ -2278,7 +2278,7 @@ mod tests {
             cache
                 .get(
                     WORK_AREA,
-                    &relative_cache_key(Path::new("second-download.bin"))
+                    &relative_cache_key(Path::new("second-download.bin")).unwrap()
                 )
                 .unwrap()
                 .is_none()
@@ -2534,13 +2534,19 @@ mod tests {
         assert_eq!(cache.checkpoints, 1);
         assert!(
             cache
-                .get(WORK_AREA, &relative_cache_key(Path::new("first.bin")))
+                .get(
+                    WORK_AREA,
+                    &relative_cache_key(Path::new("first.bin")).unwrap(),
+                )
                 .unwrap()
                 .is_some()
         );
         assert!(
             cache
-                .get(WORK_AREA, &relative_cache_key(Path::new("second.bin")))
+                .get(
+                    WORK_AREA,
+                    &relative_cache_key(Path::new("second.bin")).unwrap(),
+                )
                 .unwrap()
                 .is_none()
         );
@@ -2679,7 +2685,7 @@ mod tests {
     #[test]
     fn rewrites_cue_and_promotes_every_source_to_its_dat_name() {
         let (filesystem, config) = fixture();
-        let source_cue = b"FILE \"source.bin\" BINARY\r\n";
+        let source_cue = b"FILE \"source.bin\" BINARY\n";
         let expected_cue = b"FILE \"Game.bin\" BINARY\r\n";
         filesystem.add_file("/root/work/source.bin", b"disc".to_vec());
         filesystem.add_file("/root/work/template.cue", source_cue.to_vec());
@@ -2706,7 +2712,7 @@ mod tests {
     fn indexes_each_work_cue_once_before_content_matching() {
         let (filesystem, config) = fixture();
         let source_cue = b"FILE \"download.bin\" BINARY\n";
-        let expected_cue = b"FILE \"Game.bin\" BINARY\n";
+        let expected_cue = b"FILE \"Game.bin\" BINARY\r\n";
         filesystem.add_file(
             "/root/work/a-unmatched.cue",
             b"FILE \"absent.bin\" BINARY\n".to_vec(),
@@ -2797,7 +2803,7 @@ mod tests {
     fn exact_name_wrong_hash_cue_is_rewritten_before_other_same_count_cues() {
         let (filesystem, config) = fixture();
         let source_cue = b"FILE \"download.bin\" BINARY\n";
-        let expected_cue = b"FILE \"Game.bin\" BINARY\n";
+        let expected_cue = b"FILE \"Game.bin\" BINARY\r\n";
         filesystem.add_file("/root/work/download.bin", b"disc".to_vec());
         filesystem.add_file("/root/work/a-template.cue", source_cue.to_vec());
         filesystem.add_file("/root/work/Game.cue", source_cue.to_vec());
@@ -2823,7 +2829,7 @@ mod tests {
         let (filesystem, config) = fixture();
         let wrong_count = b"FILE \"download-one.bin\" BINARY\n";
         let source_cue = b"FILE \"download-one.bin\" BINARY\nFILE \"download-two.bin\" BINARY\n";
-        let expected_cue = b"FILE \"Game One.bin\" BINARY\nFILE \"Game Two.bin\" BINARY\n";
+        let expected_cue = b"FILE \"Game One.bin\" BINARY\r\nFILE \"Game Two.bin\" BINARY\r\n";
         filesystem.add_file("/root/work/download-one.bin", b"one".to_vec());
         filesystem.add_file("/root/work/download-two.bin", b"two".to_vec());
         filesystem.add_file("/root/work/a-wrong-count.cue", wrong_count.to_vec());
@@ -2865,7 +2871,7 @@ mod tests {
             b"FILE \"z-complete.bin\" BINARY\n".to_vec(),
         );
         let partial_cue = b"FILE \"Partial One.bin\" BINARY\nFILE \"Partial Two.bin\" BINARY\n";
-        let complete_cue = b"FILE \"Complete.bin\" BINARY\n";
+        let complete_cue = b"FILE \"Complete.bin\" BINARY\r\n";
         let catalogs = [catalog(vec![
             GameSpec {
                 name: "Partial".into(),
@@ -2979,8 +2985,8 @@ mod tests {
     fn first_complete_content_candidate_wins_the_game_order_tie() {
         let (filesystem, config) = fixture();
         let source_cue = b"FILE \"download.bin\" BINARY\n";
-        let first_cue = b"FILE \"First.bin\" BINARY\n";
-        let second_cue = b"FILE \"Second.bin\" BINARY\n";
+        let first_cue = b"FILE \"First.bin\" BINARY\r\n";
+        let second_cue = b"FILE \"Second.bin\" BINARY\r\n";
         filesystem.add_file("/root/work/download.bin", b"disc".to_vec());
         filesystem.add_file("/root/work/template.cue", source_cue.to_vec());
         let catalogs = [catalog(vec![
@@ -3173,7 +3179,8 @@ mod tests {
         filesystem.add_file("/root/library/System/Source Data.bin", b"data".to_vec());
         filesystem.add_file("/root/work/seed.bin", b"seed".to_vec());
         let source_cue = b"FILE \"seed.bin\" BINARY\nFILE \"Target Data.bin\" BINARY\n";
-        let expected_cue = b"FILE \"Target Seed.bin\" BINARY\nFILE \"Target Data.bin\" BINARY\n";
+        let expected_cue =
+            b"FILE \"Target Seed.bin\" BINARY\r\nFILE \"Target Data.bin\" BINARY\r\n";
         filesystem.add_file("/root/work/template.cue", source_cue.to_vec());
         let catalogs = [catalog(vec![
             GameSpec {
@@ -3468,7 +3475,7 @@ mod tests {
     #[test]
     fn reports_a_complete_work_copy_of_a_verified_game_as_duplicate() {
         let (filesystem, config) = fixture();
-        let expected_cue = b"FILE \"Game.bin\" BINARY\n";
+        let expected_cue = b"FILE \"Game.bin\" BINARY\r\n";
         let work_cue = b"FILE \"copy.bin\" BINARY\n";
         filesystem.add_directory("/root/library/System");
         filesystem.add_file("/root/library/System/Game.bin", b"payload".to_vec());

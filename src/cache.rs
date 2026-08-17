@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, params};
@@ -223,37 +223,33 @@ fn cache_lock_error(error: rusqlite::Error) -> RomeroError {
     }
 }
 
-pub(crate) fn relative_cache_key(path: &Path) -> String {
-    encode_path(path)
-}
-
-#[cfg(unix)]
-fn encode_path(path: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut encoded = String::from("u:");
-    for byte in path.as_os_str().as_bytes() {
-        use std::fmt::Write as _;
-        let _ = write!(encoded, "{byte:02x}");
+pub(crate) fn relative_cache_key(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str().ok_or_else(|| {
+                RomeroError::Operational(format!(
+                    "managed path is not valid Unicode and cannot be cached portably: {}",
+                    path.display()
+                ))
+            })?),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(RomeroError::Operational(format!(
+                    "cache path is not a safe relative path: {}",
+                    path.display()
+                )));
+            }
+        }
     }
-    encoded
-}
-
-#[cfg(windows)]
-fn encode_path(path: &Path) -> String {
-    use std::os::windows::ffi::OsStrExt;
-
-    let mut encoded = String::from("w:");
-    for unit in path.as_os_str().encode_wide() {
-        use std::fmt::Write as _;
-        let _ = write!(encoded, "{unit:04x}");
+    if parts.is_empty() {
+        return Err(RomeroError::Operational(
+            "cache path must identify a file".into(),
+        ));
     }
-    encoded
-}
-
-#[cfg(not(any(unix, windows)))]
-fn encode_path(path: &Path) -> String {
-    format!("p:{}", path.to_string_lossy())
+    Ok(parts.join("/"))
 }
 
 #[cfg(test)]
@@ -265,7 +261,7 @@ mod tests {
         let mut cache = SqliteCache::in_memory().unwrap();
         let record = CacheRecord {
             area: "work".into(),
-            path: relative_cache_key(Path::new("disc.bin")),
+            path: relative_cache_key(Path::new("disc.bin")).unwrap(),
             size: 42,
             modified_ns: 7,
             sha1: "1".repeat(40),
@@ -285,7 +281,7 @@ mod tests {
         let mut cache = SqliteCache::in_memory().unwrap();
         let record = CacheRecord {
             area: "work".into(),
-            path: relative_cache_key(Path::new("disc.bin")),
+            path: relative_cache_key(Path::new("disc.bin")).unwrap(),
             size: 42,
             modified_ns: 7,
             sha1: "1".repeat(40),
@@ -301,10 +297,42 @@ mod tests {
     }
 
     #[test]
-    fn cache_keys_do_not_contain_absolute_roots() {
-        let key = relative_cache_key(Path::new("Sony - PlayStation/Game.bin"));
-        assert!(!key.contains("/home"));
-        assert!(!key.contains("C:\\"));
+    fn cache_keys_are_portable_relative_unicode_paths() {
+        assert_eq!(
+            relative_cache_key(Path::new("Sony - PlayStation/Game 100%.bin")).unwrap(),
+            "Sony - PlayStation/Game 100%.bin"
+        );
+        assert_eq!(
+            relative_cache_key(Path::new("Système/ゲーム.bin")).unwrap(),
+            "Système/ゲーム.bin"
+        );
+        assert!(
+            !relative_cache_key(Path::new("Case.bin"))
+                .unwrap()
+                .eq(&relative_cache_key(Path::new("case.bin")).unwrap())
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            relative_cache_key(Path::new("System\\Game.bin")).unwrap(),
+            relative_cache_key(Path::new("System/Game.bin")).unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_keys_reject_unsafe_paths() {
+        assert!(relative_cache_key(Path::new("../disc.bin")).is_err());
+        assert!(relative_cache_key(Path::new("./disc.bin")).is_err());
+        assert!(relative_cache_key(Path::new("/")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cache_keys_reject_non_unicode_paths() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let path = OsString::from_wide(&[0xd800]);
+        assert!(relative_cache_key(Path::new(&path)).is_err());
     }
 
     #[test]
@@ -312,13 +340,13 @@ mod tests {
         let mut cache = SqliteCache::in_memory().unwrap();
         let kept = CacheRecord {
             area: "work".into(),
-            path: relative_cache_key(Path::new("kept.bin")),
+            path: relative_cache_key(Path::new("kept.bin")).unwrap(),
             size: 1,
             modified_ns: 1,
             sha1: "1".repeat(40),
         };
         let removed = CacheRecord {
-            path: relative_cache_key(Path::new("removed.bin")),
+            path: relative_cache_key(Path::new("removed.bin")).unwrap(),
             ..kept.clone()
         };
         cache.put(&kept).unwrap();
@@ -336,7 +364,7 @@ mod tests {
         let mut cache = SqliteCache::in_memory().unwrap();
         let oversized = CacheRecord {
             area: "work".into(),
-            path: relative_cache_key(Path::new("large.bin")),
+            path: relative_cache_key(Path::new("large.bin")).unwrap(),
             size: u64::MAX,
             modified_ns: 1,
             sha1: "1".repeat(40),

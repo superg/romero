@@ -1,7 +1,7 @@
 # Learned patterns
 
 - `.agents` and `.codex` are protected paths in current Codex workspace-write sandboxes. Mutable project memory belongs under `docs/agent-memory/`.
-- Cache entries must not contain the absolute Romero root. Use a stable managed-area identifier plus a path relative to that area.
+- Cache entries must not contain the absolute Romero root or a host-specific path representation. Use a stable managed-area identifier plus a validated Unicode path relative to that area, with components joined by `/`; reject non-Unicode paths instead of converting them lossily.
 - Equal SHA-1 values across games represent independent required file copies, not a shared physical library entry.
 - Unknown directories are quarantined as whole entries and left unprocessed in work. Collision suffixes append to directory names but precede a regular file's final extension.
 - A source filename is never authoritative during promotion. DAT filenames are authoritative; the source-to-target assignment is determined from the complete hash multiset and, for CUE games, validated by the rewritten CUE hash.
@@ -29,6 +29,7 @@
 - State the user-facing safety guarantee at the ROM-payload boundary: library content is moved back to work rather than deleted, while a work CUE may be removed after its validated replacement is written and generated `.miss`/cache state may be rewritten.
 - Treat CUEs as supporting evidence, never as recognition seeds. Read them once before content mutations, index valid documents by total `FILE` directive count, and search only the bucket matching the selected game's non-CUE DAT entry count. Count repeated `FILE` directives separately and ignore `TRACK` count.
 - Preserve exact-CUE precedence: accept an exact-name size/SHA-1 match without a FILE-count constraint; otherwise try a valid same-count rewrite of that exact-name sheet before other same-count sheets in deterministic filename order.
+- Normalize every parsed CUE rewrite representation to CRLF before locating and replacing `FILE` names. Hash and write those normalized rewritten bytes, preserve whether the final line has a terminator, and leave an exact size/SHA-1 CUE byte-for-byte untouched.
 - Keep complete-game work duplicates untouched, but report them after normal promotions. Use work-only multiset and CUE validation, reserve selected physical files across deterministic duplicate blocks, retain typed details for library consumers, and never let duplicate diagnostics mutate work.
 - Emit incomplete diagnostics at the point a content-queue winner is selected. Retain the typed details in `ExecutionSummary` for consumers but omit them from its final `Display`, preventing delayed or duplicate CLI output.
 - In content matching, a complete candidate always beats an incomplete one. Complete ties use case-insensitive system/game order; incomplete candidates score selected work, verified library content, and a valid CUE before the same tie-breaker. Claim selected work, displayed mismatches, and the selected CUE only after choosing the one winner.

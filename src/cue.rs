@@ -12,9 +12,10 @@ pub(crate) struct CueDocument {
 
 impl CueDocument {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let source = std::str::from_utf8(bytes)
-            .map_err(|_| RomeroError::Operational("CUE is not valid UTF-8".into()))?
-            .to_owned();
+        let source = normalize_line_endings(
+            std::str::from_utf8(bytes)
+                .map_err(|_| RomeroError::Operational("CUE is not valid UTF-8".into()))?,
+        );
         let mut references = BTreeMap::<String, Vec<Range<usize>>>::new();
         let mut offset = 0;
 
@@ -66,6 +67,32 @@ impl CueDocument {
         }
         Ok(rewritten.into_bytes())
     }
+}
+
+fn normalize_line_endings(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\r' => {
+                normalized.extend_from_slice(b"\r\n");
+                cursor += 1;
+                if bytes.get(cursor) == Some(&b'\n') {
+                    cursor += 1;
+                }
+            }
+            b'\n' => {
+                normalized.extend_from_slice(b"\r\n");
+                cursor += 1;
+            }
+            byte => {
+                normalized.push(byte);
+                cursor += 1;
+            }
+        }
+    }
+    String::from_utf8(normalized).expect("normalizing ASCII line endings preserves UTF-8")
 }
 
 fn parse_file_directive(
@@ -144,8 +171,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rewrites_only_filename_tokens_and_preserves_line_endings() {
-        let source = b"FILE \"old.bin\" BINARY\r\n  TRACK 01 MODE2/2352\r\nFILE old.bin BINARY\r\n";
+    fn rewrites_filename_tokens_and_normalizes_line_endings_to_crlf() {
+        let source = b"FILE \"old.bin\" BINARY\n  TRACK 01 MODE2/2352\rFILE old.bin BINARY\r\nREM no final newline";
         let cue = CueDocument::parse(source).unwrap();
         let rewritten = cue
             .rewrite(&BTreeMap::from([(
@@ -155,8 +182,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             rewritten,
-            b"FILE \"Final Name.bin\" BINARY\r\n  TRACK 01 MODE2/2352\r\nFILE Final Name.bin BINARY\r\n"
+            b"FILE \"Final Name.bin\" BINARY\r\n  TRACK 01 MODE2/2352\r\nFILE Final Name.bin BINARY\r\nREM no final newline"
         );
+    }
+
+    #[test]
+    fn rewrite_keeps_existing_crlf_without_doubling_carriage_returns() {
+        let cue = CueDocument::parse(b"FILE old.bin BINARY\r\n").unwrap();
+        let rewritten = cue
+            .rewrite(&BTreeMap::from([("old.bin".into(), "final.bin".into())]))
+            .unwrap();
+
+        assert_eq!(rewritten, b"FILE final.bin BINARY\r\n");
     }
 
     #[test]
